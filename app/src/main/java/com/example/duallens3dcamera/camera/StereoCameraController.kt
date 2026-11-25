@@ -19,8 +19,11 @@ import android.util.Size
 import android.view.Surface
 import com.example.duallens3dcamera.util.StereoSbs
 import com.example.duallens3dcamera.encoding.AudioEncoder
+import com.example.duallens3dcamera.encoding.DirectSbsRecorder
 import com.example.duallens3dcamera.encoding.Mp4Muxer
+import com.example.duallens3dcamera.encoding.StereoVideoStitcher
 import com.example.duallens3dcamera.encoding.VideoEncoder
+import com.example.duallens3dcamera.settings.AppSettings
 import com.example.duallens3dcamera.image.toNv21
 import com.example.duallens3dcamera.media.DngWriter
 import com.example.duallens3dcamera.media.ImageWriters
@@ -52,6 +55,13 @@ class StereoCameraController(
         fun onRecordingStarted()
         fun onRecordingStopped()
         fun onPhotoCaptureDone()
+        /** Background SBS stitch progress (0.76.5): stage text + frames done/total. */
+        fun onStitchProgress(stage: String, done: Int, total: Int)
+        /** Background SBS stitch finished: success + stitched frame count. */
+        fun onStitchDone(success: Boolean, frames: Int)
+        /** Direct SBS mode (0.77.0): the cameras are running and the lenses
+         *  are settling before encoding starts. */
+        fun onDirectWarmup() {}
     }
 
     data class PreviewConfig(
@@ -165,6 +175,17 @@ class StereoCameraController(
     private var cameraDevice: CameraDevice? = null
     private var session: CameraCaptureSession? = null
 
+    // MOTO dual-device mode (no logical camera): a second, standalone CameraDevice +
+    // capture session for the ultrawide. cameraDevice/session above are the WIDE ones;
+    // ultraCameraDevice/ultraSession are the ULTRA ones. Null in logical mode.
+    private var ultraCameraDevice: CameraDevice? = null
+    private var ultraSession: CameraCaptureSession? = null
+    private var ultraRepeatingBuilder: CaptureRequest.Builder? = null
+    // True once the dual-device rig was discovered (Moto G Stylus 2026 and friends).
+    private var isDualDevice: Boolean = false
+    // True while the ultra device is still opening (wide opened first, ultra second).
+    private var dualUltraOpening: Boolean = false
+
     private var surfaceTexture: SurfaceTexture? = null
     private var previewSurface: Surface? = null
 
@@ -188,6 +209,14 @@ class StereoCameraController(
     @Volatile private var zoom2xEnabled: Boolean = false
     private var hasWide2xPhysical: Boolean = false
 
+    /**
+     * Digital crop zoom for dual-device mode (0.76.5): 1.0 = full sensor,
+     * 2.0 = centered half-size window. The SAME relative crop is applied to
+     * both lenses, so the stereo geometry is unchanged (the SBS aligner
+     * must therefore NOT do its extra ultra crop — see the photo path).
+     */
+    @Volatile private var zoomCropFactor: Float = 1.0f
+
 
     private var wideMap: StreamConfigurationMap? = null
     private var ultraMap: StreamConfigurationMap? = null
@@ -209,6 +238,9 @@ class StereoCameraController(
     private var isRawMode: Boolean = false
     private var torchOn: Boolean = false
     private var isRecording: Boolean = false
+    // Timestamp stem of the current recording ("yyyy-MM-dd-HH-mm-ss-SSS");
+    // used to name the stitched *_sbs.mp4 after stop. Null when not recording.
+    private var currentRecordingId: String? = null
 
     // mutable video config (set from UI, persisted in Activity)
     private var requestedRecordSize: Size = Size(1440, 1080)  // default corresponds to upright 1080x1440
@@ -268,6 +300,15 @@ class StereoCameraController(
     private var wideVideoUri: Uri? = null
     private var ultraVideoUri: Uri? = null
 
+    // Direct SBS recording (0.77.0): one finished *_sbs.mp4 recorded live
+    // from both lenses. No per-lens encoders/muxers in this mode.
+    private var isDirectRecording: Boolean = false
+    private var directRecorder: DirectSbsRecorder? = null
+    private var directVideoUri: Uri? = null
+    private var directRecordingId: String? = null
+    private var dualDirectWideReady: Boolean = false
+    private var dualDirectUltraReady: Boolean = false
+
     // Photo capture coordination
     private data class PhotoCapture(
         val isRaw: Boolean,
@@ -275,13 +316,23 @@ class StereoCameraController(
         val wallTimeMs: Long,
         val wideUri: Uri?,
         val ultraUri: Uri?,
-        val sbsUri: Uri? = null,
+        // Color-matched SBS variants (built from the aligned SBS bytes held in
+        // memory): both eyes synced to the wide's colors, and both eyes synced
+        // to the ultra's colors. The plain unmatched SBS is NOT saved anymore
+        // (the tester only wants the two matched versions). Null in RAW mode
+        // (no SBS at all there).
+        val sbsMatchedWideUri: Uri? = null,
+        val sbsMatchedUltraUri: Uri? = null,
         val logUri: Uri? = null,
         val exifDateTimeOriginal: String,
         val rotationDegrees: Int,
         @Volatile var wideImage: Image? = null,
         @Volatile var ultraImage: Image? = null,
         @Volatile var totalResult: TotalCaptureResult? = null,
+        // Dual-device mode: each camera delivers its own TotalCaptureResult (there is
+        // no logical result with physicalCameraResults). Null in logical mode.
+        @Volatile var wideResult: TotalCaptureResult? = null,
+        @Volatile var ultraResult: TotalCaptureResult? = null,
         @Volatile var finished: Boolean = false
     )
 
@@ -399,12 +450,17 @@ class StereoCameraController(
         val wMap = wideMap ?: return
         val uMap = ultraMap ?: return
 
+        // MOTO dual-device: mandatory CONCURRENT combos cap each camera at 1920x1440
+        // while both are open, even though each camera alone lists up to 4000x3000.
+        val capW = if (isDualDevice) minOf(requestedRecordSize.width, 1920) else requestedRecordSize.width
+        val capH = if (isDualDevice) minOf(requestedRecordSize.height, 1440) else requestedRecordSize.height
+
         val (chosenRecord, fallbackMsg) = SizeSelector.chooseCommonPrivateSizeAtFps(
             wideMap = wMap,
             ultraMap = uMap,
             preferred = requestedRecordSize,
-            maxW = requestedRecordSize.width,
-            maxH = requestedRecordSize.height,
+            maxW = capW,
+            maxH = capH,
             targetFps = requestedRecordFps
         )
         recordSize = chosenRecord
@@ -461,7 +517,14 @@ class StereoCameraController(
 
         when (photoStillResolutionMode) {
             StillResolutionMode.LARGEST_COMMON -> {
-                val commonYuv = SizeSelector.chooseLargestCommonYuvFourByThree(wMap, uMap)
+                // MOTO dual-device: cap the common still size at 1920x1440 (mandatory
+                // concurrent limit). Largest common YUV 4:3 on the Moto is 4000x3000 —
+                // do NOT use it while both cameras are open.
+                val commonYuv = if (isDualDevice) {
+                    SizeSelector.chooseLargestCommonYuvFourByThreeCapped(wMap, uMap, 1920, 1440)
+                } else {
+                    SizeSelector.chooseLargestCommonYuvFourByThree(wMap, uMap)
+                }
                 if (commonYuv != null) {
                     yuvWideSize = commonYuv
                     yuvUltraSize = commonYuv
@@ -474,19 +537,35 @@ class StereoCameraController(
                     )
                 }
 
-                val commonRaw = SizeSelector.chooseLargestCommonRaw(wMap, uMap)
-                if (commonRaw != null) {
-                    rawWideSize = commonRaw
-                    rawUltraSize = commonRaw
-                } else {
+                // RAW sizes differ per lens on the Moto (wide 4096x3072, ultra 4160x3120),
+                // so a common RAW size does not exist — use per-lens RAW in dual mode.
+                if (isDualDevice) {
                     rawWideSize = SizeSelector.chooseLargestRaw(wMap)
                     rawUltraSize = SizeSelector.chooseLargestRaw(uMap)
+                } else {
+                    val commonRaw = SizeSelector.chooseLargestCommonRaw(wMap, uMap)
+                    if (commonRaw != null) {
+                        rawWideSize = commonRaw
+                        rawUltraSize = commonRaw
+                    } else {
+                        rawWideSize = SizeSelector.chooseLargestRaw(wMap)
+                        rawUltraSize = SizeSelector.chooseLargestRaw(uMap)
+                    }
                 }
             }
 
             StillResolutionMode.LARGEST_PER_LENS -> {
-                yuvWideSize = SizeSelector.chooseLargestYuvFourByThree(wMap)
-                yuvUltraSize = SizeSelector.chooseLargestYuvFourByThree(uMap)
+                // In dual-device mode the per-lens sizes are also capped at the
+                // concurrent limit (1920x1440); uncapped they would be 4096x3072/4160x3120.
+                if (isDualDevice) {
+                    yuvWideSize = SizeSelector.chooseLargestCommonYuvFourByThreeCapped(wMap, wMap, 1920, 1440)
+                        ?: Size(1920, 1440)
+                    yuvUltraSize = SizeSelector.chooseLargestCommonYuvFourByThreeCapped(uMap, uMap, 1920, 1440)
+                        ?: Size(1920, 1440)
+                } else {
+                    yuvWideSize = SizeSelector.chooseLargestYuvFourByThree(wMap)
+                    yuvUltraSize = SizeSelector.chooseLargestYuvFourByThree(uMap)
+                }
                 rawWideSize = SizeSelector.chooseLargestRaw(wMap)
                 rawUltraSize = SizeSelector.chooseLargestRaw(uMap)
             }
@@ -512,9 +591,16 @@ class StereoCameraController(
 
             try { session?.close() } catch (_: Exception) {}
             session = null
+            // Dual-device: close the ultrawide session/device too.
+            try { ultraSession?.close() } catch (_: Exception) {}
+            ultraSession = null
+            ultraRepeatingBuilder = null
+            dualUltraOpening = false
 
             try { cameraDevice?.close() } catch (_: Exception) {}
             cameraDevice = null
+            try { ultraCameraDevice?.close() } catch (_: Exception) {}
+            ultraCameraDevice = null
 
             closeReaders()
 
@@ -535,14 +621,26 @@ class StereoCameraController(
         handler.post { updateTorchOnRepeating() }
     }
 
+    /**
+     * The activity calls this when the device rotation changes (0.76.5: the
+     * Moto activity runs in sensorLandscape). The value feeds
+     * computeOrientationHint() and the per-frame rotation, so photos and
+     * videos come out upright in both landscape directions.
+     */
+    fun setDisplayRotation(rotation: Int) {
+        displayRotation = rotation
+    }
+
     fun setPhotoOutputRaw(raw: Boolean) {
         val handler = cameraHandler ?: return
         handler.post {
             // don't change photo settings while recording video
             if (isRecording) return@post
             // RAW currently fails on Samsung so
-            // don't allow it on them for now (force jpg instead)
-            if (!phoneIsAPixel && raw) {
+            // don't allow it on them for now (force jpg instead).
+            // MOTO dual-device is the exception: both Moto lenses are LEVEL_3 with
+            // RAW_SENSOR, so RAW is allowed there (per-lens RAW sizes).
+            if (!phoneIsAPixel && !isDualDevice && raw) {
                 if (isRawMode) isRawMode = false
                 callback.onStatus("RAW/DNG is Pixel-only for now (Samsung uses JPG only).")
                 return@post
@@ -566,6 +664,19 @@ class StereoCameraController(
         }
 
         handler.post {
+            if (isDualDevice) {
+                // MOTO dual-device (0.76.5): no 2x physical camera, so zoom
+                // is a digital crop — the SAME centered crop on both lenses,
+                // so the stereo geometry (and the SBS alignment) is unchanged.
+                if (zoom2xEnabled == enabled) return@post
+                zoom2xEnabled = enabled
+                zoomCropFactor = if (enabled) 2.0f else 1.0f
+                // The cached affine is in pixel space of the uncropped
+                // frame; a crop changes that mapping, so drop it.
+                StereoSbs.resetLastGoodAffine()
+                reapplyZoomCropToRepeating()
+                return@post
+            }
             if (isRecording) {
                 callback.onStatus("Can't change zoom while recording.")
                 return@post
@@ -638,6 +749,58 @@ class StereoCameraController(
         }
     }
 
+    /**
+     * Digital crop zoom for dual-device mode (0.76.5). The crop window is
+     * the same RELATIVE window on both sensors (centered, 1/factor of each
+     * side), so both lenses see the same narrower field of view and the
+     * stereo geometry is unchanged. At 1x the full active array is set
+     * explicitly so the state is never left over from a previous 2x.
+     */
+    private fun zoomCropRect(chars: CameraCharacteristics?): Rect? {
+        val active = chars?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: return null
+        val f = zoomCropFactor
+        if (f <= 1.0f) return Rect(active)
+        val w = (active.width() / f).toInt().coerceAtLeast(2)
+        val h = (active.height() / f).toInt().coerceAtLeast(2)
+        val left = active.left + (active.width() - w) / 2
+        val top = active.top + (active.height() - h) / 2
+        return Rect(left, top, left + w, top + h)
+    }
+
+    /** Apply the current crop zoom to a request builder (dual-device only). */
+    private fun applyZoomCrop(builder: CaptureRequest.Builder, chars: CameraCharacteristics?) {
+        if (!isDualDevice) return
+        val rect = zoomCropRect(chars) ?: return
+        try { builder.set(CaptureRequest.SCALER_CROP_REGION, rect) } catch (_: Exception) {}
+    }
+
+    /** Re-issue the live preview repeating requests with the current crop. */
+    private fun reapplyZoomCropToRepeating() {
+        val handler = cameraHandler ?: return
+        handler.post {
+            try {
+                val rb = repeatingBuilder
+                val sess = session
+                if (rb != null && sess != null) {
+                    applyZoomCrop(rb, wideChars)
+                    sess.setRepeatingRequest(rb.build(), null, handler)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Reapply zoom crop (wide) failed: ${e.message}")
+            }
+            try {
+                val urb = ultraRepeatingBuilder
+                val usess = ultraSession
+                if (urb != null && usess != null) {
+                    applyZoomCrop(urb, ultraChars)
+                    usess.setRepeatingRequest(urb.build(), null, handler)
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Reapply zoom crop (ultra) failed: ${e.message}")
+            }
+        }
+    }
+
     fun captureStereoPhoto(timestampForFilename: String, raw: Boolean) {
         val handler = cameraHandler ?: run {
             callback.onError("Camera thread not running.")
@@ -655,10 +818,16 @@ class StereoCameraController(
                 callback.onPhotoCaptureDone()
                 return@post
             }
+            if (isDualDevice && (ultraCameraDevice == null || ultraSession == null)) {
+                callback.onError("Ultrawide camera not ready (Moto dual-device).")
+                callback.onPhotoCaptureDone()
+                return@post
+            }
 
-            // don't allow RAW on Samsung
-            val effectiveRaw = raw && phoneIsAPixel
-            if (raw && !phoneIsAPixel) {
+            // Don't allow RAW on Samsung (fails there). Pixel and Moto dual-device
+            // (both lenses LEVEL_3 + RAW) may use it.
+            val effectiveRaw = raw && (phoneIsAPixel || isDualDevice)
+            if (raw && !phoneIsAPixel && !isDualDevice) {
                 callback.onStatus("RAW is Pixel-only for now (Samsung uses YUV).")
             }
             if (effectiveRaw != isRawMode) {
@@ -686,9 +855,16 @@ class StereoCameraController(
                     MediaStoreUtils.createPendingImage(context, ultraName, ultraMime, nowMs)
                 } else null
 
-                val sbsUri = if (!effectiveRaw) {
-                    val sbsName = "${timestampForFilename}_sbs.jpg"
-                    MediaStoreUtils.createPendingImage(context, sbsName, "image/jpeg", nowMs)
+                // Color-matched SBS variants (same alignment, colors synced to
+                // one eye or the other). The plain unmatched SBS is not saved.
+                val sbsMatchedWideUri = if (!effectiveRaw) {
+                    val name = "${timestampForFilename}_sbs_matched_wide.jpg"
+                    MediaStoreUtils.createPendingImage(context, name, "image/jpeg", nowMs)
+                } else null
+
+                val sbsMatchedUltraUri = if (!effectiveRaw) {
+                    val name = "${timestampForFilename}_sbs_matched_ultra.jpg"
+                    MediaStoreUtils.createPendingImage(context, name, "image/jpeg", nowMs)
                 } else null
 
                 val logUri = if (enablePhotoJsonLog) {
@@ -702,7 +878,8 @@ class StereoCameraController(
                     wallTimeMs = nowMs,
                     wideUri = wideUri,
                     ultraUri = ultraUri,
-                    sbsUri = sbsUri,
+                    sbsMatchedWideUri = sbsMatchedWideUri,
+                    sbsMatchedUltraUri = sbsMatchedUltraUri,
                     logUri = logUri,
                     exifDateTimeOriginal = exifDt,
                     rotationDegrees = rotationDegrees
@@ -734,10 +911,32 @@ class StereoCameraController(
                 callback.onError("Camera not ready.")
                 return@post
             }
+            if (isDualDevice && ultraCameraDevice == null) {
+                callback.onError("Ultrawide camera not ready (Moto dual-device).")
+                return@post
+            }
 
             isRecording = true
+            currentRecordingId = timestampForFilename
             closeReaders() // reduce load during recording
 
+            // 0.77.0: direct SBS mode (Moto dual-device only). If it can't
+            // start, fall through to the two-stream path with the same id.
+            if (AppSettings.isDirectRecordMode(context) && isDualDevice) {
+                if (tryStartDirectRecordingLocked(timestampForFilename)) return@post
+                callback.onStatus("Direct SBS couldn't start — using the two-stream mode")
+            }
+
+            startStitchedRecordingLocked(timestampForFilename)
+        }
+    }
+
+    /**
+     * Two-stream recording (the original path): one encoder + muxer per
+     * lens, stitched into an SBS video after stop. Assumes isRecording and
+     * currentRecordingId are already set and the photo readers are closed.
+     */
+    private fun startStitchedRecordingLocked(timestampForFilename: String) {
             val nowMs = System.currentTimeMillis()
             val wideName = "${timestampForFilename}_wide.mp4"
             val ultraName = "${timestampForFilename}_ultrawide.mp4"
@@ -868,6 +1067,303 @@ class StereoCameraController(
                 safeStopRecordingInternal(deleteOnFailure = true)
                 isRecording = false
             }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Direct SBS recording (0.77.0)
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * Per-eye size for direct mode: the record size capped at 1440x1080,
+     * aspect preserved, even dimensions (YUV420). CPU composition can't
+     * sustain full 1920x1440 at 30fps, so a bigger record size records
+     * smaller in direct mode — the two-stream path keeps full size.
+     */
+    private fun directEyeSize(): Size {
+        val w = recordSize.width
+        val h = recordSize.height
+        val scale = minOf(1440.0 / w, 1080.0 / h, 1.0)
+        var ew = (w * scale).toInt()
+        var eh = (h * scale).toInt()
+        if (ew % 2 != 0) ew -= 1
+        if (eh % 2 != 0) eh -= 1
+        return Size(ew.coerceAtLeast(320), eh.coerceAtLeast(240))
+    }
+
+    /**
+     * Start the direct SBS flow. Returns true once the direct record
+     * sessions are being created (warm-up + encoding follow asynchronously);
+     * false if direct can't start at all (caller falls through to the
+     * two-stream path). Assumes isRecording and currentRecordingId are set.
+     */
+    private fun tryStartDirectRecordingLocked(timestampForFilename: String): Boolean {
+        // The direct wide session is preview (PRIVATE) + a YUV reader, which
+        // the phone's mandatory concurrent combinations only allow with the
+        // preview at <=1280x720 (combo [5]).
+        if (previewSize.width > 1280 || previewSize.height > 720) return false
+        val eyeSize = directEyeSize()
+        val orient = computeOrientationHint()
+        return try {
+            val sbsUri = MediaStoreUtils.createPendingVideo(
+                context, "${timestampForFilename}_sbs.mp4", System.currentTimeMillis()
+            )
+            directVideoUri = sbsUri
+            directRecordingId = timestampForFilename
+            directRecorder = DirectSbsRecorder(
+                context = context,
+                outputUri = sbsUri,
+                eyeSize = eyeSize,
+                fps = requestedRecordFps,
+                bitrateBps = videoBitrateBps * 2,
+                orientationHint = orient,
+                rotationDegrees = computeJpegOrientation(),
+                sbsView = StereoSbs.SbsView.fromSetting(AppSettings.getSbsView(context)),
+                colorMatch = StereoVideoStitcher.colorMatchFromSetting(
+                    AppSettings.getVideoColorMatch(context)
+                ),
+                listenerHandler = requireNotNull(cameraHandler)
+            )
+            isDirectRecording = true
+            createDirectRecordingSessions()
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Direct SBS setup failed: ${e.message}", e)
+            releaseDirectState()
+            false
+        }
+    }
+
+    /**
+     * MOTO dual-device direct recording: two sessions, one per camera.
+     *  - Wide session: preview + wide YUV reader.
+     *  - Ultra session: ultra YUV reader only.
+     * Both repeating requests are started back-to-back once both sessions
+     * are configured; the warm-up clock starts then, and encoding starts
+     * once the settle pair has been estimated (~1s later).
+     */
+    private fun createDirectRecordingSessions() {
+        surfaceTexture?.setDefaultBufferSize(previewSize.width, previewSize.height)
+
+        val wideCamera = cameraDevice ?: return
+        val ultraCamera = ultraCameraDevice ?: return
+        val handler = requireNotNull(cameraHandler)
+        val preview = previewSurface ?: return
+        val recorder = directRecorder ?: return
+
+        try { session?.close() } catch (_: Exception) {}
+        session = null
+        repeatingBuilder = null
+        try { ultraSession?.close() } catch (_: Exception) {}
+        ultraSession = null
+        ultraRepeatingBuilder = null
+        dualDirectWideReady = false
+        dualDirectUltraReady = false
+
+        fun maybeStartDirectWarmup() {
+            if (!dualDirectWideReady || !dualDirectUltraReady) return
+            val wideSess = session ?: return
+            val ultraSess = ultraSession ?: return
+            val wideBuilder = repeatingBuilder ?: return
+            val ultraBuilder = ultraRepeatingBuilder ?: return
+            try {
+                // Start wide first, ultra immediately after, on the same handler thread.
+                wideSess.setRepeatingRequest(wideBuilder.build(), null, handler)
+                ultraSess.setRepeatingRequest(ultraBuilder.build(), null, handler)
+            } catch (e: Exception) {
+                callback.onError("Direct record repeating request failed: ${e.message}")
+                fallbackDirectToStitched()
+                return
+            }
+            recorder.beginWarmup()
+            callback.onDirectWarmup()
+            ioExecutor.execute {
+                // 0.77.2: catch Throwable here too — an Error escaping this
+                // pool thread kills the whole app; a failure must fall back
+                // to the two-stream path instead.
+                try {
+                    val ok = recorder.estimateParams()
+                    cameraHandler?.post {
+                        if (!isDirectRecording) return@post
+                        if (ok && recorder.startEncoding()) {
+                            callback.onRecordingStarted()
+                        } else {
+                            fallbackDirectToStitched()
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Direct warm-up failed: ${t.message}", t)
+                    cameraHandler?.post {
+                        if (isDirectRecording) fallbackDirectToStitched()
+                    }
+                }
+            }
+        }
+
+        // --- Wide direct session: preview + wide YUV reader ---
+        val wideOutputs = ArrayList<OutputConfiguration>(2).apply {
+            add(OutputConfiguration(preview))
+            add(OutputConfiguration(recorder.wideReader.surface))
+        }
+        wideCamera.createCaptureSessionByOutputConfigurations(
+            wideOutputs,
+            object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(sess: CameraCaptureSession) {
+                    session = sess
+                    try {
+                        val builder = wideCamera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                            addTarget(preview)
+                            addTarget(recorder.wideReader.surface)
+                            applyCommonNoCropNoStab(this, isVideo = true, targetFps = requestedRecordFps)
+                            applyZoomCrop(this, wideChars)
+                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                            set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                            try { set(CaptureRequest.NOISE_REDUCTION_MODE, videoNoiseReductionMode) } catch (_: Exception) {}
+                            try { set(CaptureRequest.DISTORTION_CORRECTION_MODE, videoDistortionCorrectionMode) } catch (_: Exception) {}
+                            try { set(CaptureRequest.EDGE_MODE, videoEdgeMode) } catch (_: Exception) {}
+                            applyTorch(this)
+                        }
+                        repeatingBuilder = builder
+                        dualDirectWideReady = true
+                        maybeStartDirectWarmup()
+                    } catch (e: Exception) {
+                        callback.onError("Wide direct record request failed: ${e.message}")
+                        fallbackDirectToStitched()
+                    }
+                }
+
+                override fun onConfigureFailed(sess: CameraCaptureSession) {
+                    callback.onError("Wide direct recording session configure failed (Moto dual-device).")
+                    fallbackDirectToStitched()
+                }
+            },
+            handler
+        )
+
+        // --- Ultra direct session: ultra YUV reader only ---
+        val ultraOutputs = ArrayList<OutputConfiguration>(1).apply {
+            add(OutputConfiguration(recorder.ultraReader.surface))
+        }
+        ultraCamera.createCaptureSessionByOutputConfigurations(
+            ultraOutputs,
+            object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(sess: CameraCaptureSession) {
+                    ultraSession = sess
+                    try {
+                        val builder = ultraCamera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                            addTarget(recorder.ultraReader.surface)
+                            applyCommonNoCropNoStab(this, isVideo = true, targetFps = requestedRecordFps, forUltraDevice = true)
+                            applyZoomCrop(this, ultraChars)
+                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                            set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                            try { set(CaptureRequest.NOISE_REDUCTION_MODE, videoNoiseReductionMode) } catch (_: Exception) {}
+                            try { set(CaptureRequest.DISTORTION_CORRECTION_MODE, videoDistortionCorrectionMode) } catch (_: Exception) {}
+                            try { set(CaptureRequest.EDGE_MODE, videoEdgeMode) } catch (_: Exception) {}
+                            // No torch on the ultra builder (shared flash, driven by wide).
+                        }
+                        ultraRepeatingBuilder = builder
+                        dualDirectUltraReady = true
+                        maybeStartDirectWarmup()
+                    } catch (e: Exception) {
+                        callback.onError("Ultra direct record request failed: ${e.message}")
+                        fallbackDirectToStitched()
+                    }
+                }
+
+                override fun onConfigureFailed(sess: CameraCaptureSession) {
+                    callback.onError("Ultra direct recording session configure failed (Moto dual-device).")
+                    fallbackDirectToStitched()
+                }
+            },
+            handler
+        )
+    }
+
+    /**
+     * Direct setup failed mid-flight (session configure / warm-up /
+     * encoder start): release direct state and run the two-stream path
+     * with the same recording id. Must run on the camera handler thread.
+     * Safe to call when already stopped — it no-ops then.
+     */
+    private fun fallbackDirectToStitched() {
+        if (!isDirectRecording) return
+        releaseDirectState()
+        callback.onStatus("Direct SBS couldn't start — using the two-stream mode")
+        val id = currentRecordingId ?: return
+        startStitchedRecordingLocked(id)
+    }
+
+    /**
+     * Release direct sessions + recorder (deleting the partial SBS file).
+     * Keeps isRecording and currentRecordingId — the fallback needs them.
+     */
+    private fun releaseDirectState() {
+        try { session?.stopRepeating() } catch (_: Exception) {}
+        try { session?.abortCaptures() } catch (_: Exception) {}
+        try { session?.close() } catch (_: Exception) {}
+        try { ultraSession?.stopRepeating() } catch (_: Exception) {}
+        try { ultraSession?.abortCaptures() } catch (_: Exception) {}
+        try { ultraSession?.close() } catch (_: Exception) {}
+        session = null
+        repeatingBuilder = null
+        ultraSession = null
+        ultraRepeatingBuilder = null
+        dualDirectWideReady = false
+        dualDirectUltraReady = false
+        recordCaptureCallback = null
+        val recorder = directRecorder
+        directRecorder = null
+        directVideoUri = null
+        directRecordingId = null
+        isDirectRecording = false
+        try { recorder?.cancelWarmup() } catch (_: Exception) {}
+        try { recorder?.releaseOnFailure() } catch (_: Exception) {}
+    }
+
+    /**
+     * Stop a direct recording: finalize the single SBS file on a background
+     * thread, restore the preview session, report the frame count.
+     */
+    private fun stopDirectRecordingLocked() {
+        try { session?.stopRepeating() } catch (_: Exception) {}
+        try { session?.abortCaptures() } catch (_: Exception) {}
+        try { session?.close() } catch (_: Exception) {}
+        try { ultraSession?.stopRepeating() } catch (_: Exception) {}
+        try { ultraSession?.abortCaptures() } catch (_: Exception) {}
+        try { ultraSession?.close() } catch (_: Exception) {}
+        session = null
+        repeatingBuilder = null
+        ultraSession = null
+        ultraRepeatingBuilder = null
+        dualDirectWideReady = false
+        dualDirectUltraReady = false
+        recordCaptureCallback = null
+
+        val recorder = directRecorder
+        directRecorder = null
+        directVideoUri = null
+        directRecordingId = null
+        isDirectRecording = false
+        isRecording = false
+
+        encodingExecutor.execute {
+            val frames = try {
+                recorder?.cancelWarmup()
+                recorder?.stopAndFinalize() ?: 0
+            } catch (e: Exception) {
+                Log.w(TAG, "Direct SBS finalize failed: ${e.message}", e)
+                0
+            }
+            if (frames > 0) {
+                callback.onStatus("3D video saved ($frames frames)")
+            } else {
+                callback.onStatus("Direct recording saved no frames — check the video")
+            }
+            cameraHandler?.post {
+                if (cameraDevice != null && previewSurface != null) {
+                    createPreviewSession()
+                }
+                callback.onRecordingStopped()
+            }
         }
     }
 
@@ -884,13 +1380,25 @@ class StereoCameraController(
                 return@post
             }
 
+            // 0.77.0: direct SBS mode has its own stop path (single file, no stitch).
+            if (isDirectRecording) {
+                stopDirectRecordingLocked()
+                return@post
+            }
+
             // Stop camera outputs first.
             try { session?.stopRepeating() } catch (_: Exception) {}
             try { session?.abortCaptures() } catch (_: Exception) {}
             try { session?.close() } catch (_: Exception) {}
+            // Dual-device: stop the ultrawide session too.
+            try { ultraSession?.stopRepeating() } catch (_: Exception) {}
+            try { ultraSession?.abortCaptures() } catch (_: Exception) {}
+            try { ultraSession?.close() } catch (_: Exception) {}
 
             session = null
             repeatingBuilder = null
+            ultraSession = null
+            ultraRepeatingBuilder = null
             recordCaptureCallback = null
 
             val resolver = context.contentResolver
@@ -898,6 +1406,8 @@ class StereoCameraController(
             // Move refs locally for the async stop/release path.
             val wideUriLocal = wideVideoUri
             val ultraUriLocal = ultraVideoUri
+            val recordingIdLocal = currentRecordingId
+            val stitchBitrateBps = videoBitrateBps * 2
 
             val wEnc = wideEncoder
             val uEnc = ultraEncoder
@@ -908,6 +1418,7 @@ class StereoCameraController(
 
             wideVideoUri = null
             ultraVideoUri = null
+            currentRecordingId = null
             wideEncoder = null
             ultraEncoder = null
             audioEncoder = null
@@ -940,6 +1451,50 @@ class StereoCameraController(
                 // Make files visible in MediaStore
                 if (wideUriLocal != null) MediaStoreUtils.finalizePending(resolver, wideUriLocal)
                 if (ultraUriLocal != null) MediaStoreUtils.finalizePending(resolver, ultraUriLocal)
+
+                // Stitched SBS video (background; the two separate MP4s are
+                // already saved, so a stitch failure costs nothing). Colors
+                // default to the wide eye (warmer); see Settings > Video.
+                if (AppSettings.getVideoStitchSbsEnabled(context) &&
+                    wideUriLocal != null && ultraUriLocal != null && recordingIdLocal != null
+                ) {
+                    val stitchWideUri = wideUriLocal
+                    val stitchUltraUri = ultraUriLocal
+                    val stitchRecordId = recordingIdLocal
+                    val stitchMatch =
+                        StereoVideoStitcher.colorMatchFromSetting(AppSettings.getVideoColorMatch(context))
+                    ioExecutor.execute {
+                        try {
+                            val result = StereoVideoStitcher.stitch(
+                                context = context,
+                                wideUri = stitchWideUri,
+                                ultraUri = stitchUltraUri,
+                                outputName = "${stitchRecordId}_sbs.mp4",
+                                timestampMillis = System.currentTimeMillis(),
+                                colorMatch = stitchMatch,
+                                bitrateBps = stitchBitrateBps,
+                                sbsView = StereoSbs.SbsView.fromSetting(
+                                    AppSettings.getSbsView(context)
+                                ),
+                                onProgress = { stage, done, total ->
+                                    callback.onStitchProgress(stage, done, total)
+                                }
+                            )
+                            if (result != null) {
+                                callback.onStitchDone(true, result.frames)
+                                callback.onStatus("SBS video saved (${result.frames} frames)")
+                            } else {
+                                Log.w(TAG, "SBS video stitching failed; separate videos kept")
+                                callback.onStitchDone(false, 0)
+                                callback.onStatus("SBS video couldn't be stitched — the two separate videos are saved")
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "SBS video stitching failed: ${e.message}", e)
+                            callback.onStitchDone(false, 0)
+                            callback.onStatus("SBS video couldn't be stitched — the two separate videos are saved")
+                        }
+                    }
+                }
 
                 // Write + finalize the stereo JSON log
                 if (loggerLocal != null && logUriLocal != null) {
@@ -984,8 +1539,14 @@ class StereoCameraController(
 
     private fun selectCharacteristicsAndSizes() {
 
-        // Discover the rear logical camera + physical IDs (Pixel + Samsung).
+        // Discover the rear logical camera + physical IDs (Pixel + Samsung),
+        // or the hidden dual-device rig (Moto, no logical camera).
         val rig = LensDiscovery.discoverStereoRig(cameraManager)
+
+        if (rig != null && rig.isDualDevice) {
+            selectDualCharacteristicsAndSizes(rig)
+            return
+        }
 
         if (rig != null) {
             logicalRearId = rig.logicalRearId
@@ -1073,8 +1634,82 @@ class StereoCameraController(
 
     }
 
+    /**
+     * MOTO dual-device setup (no logical camera). The two rig IDs are standalone
+     * camera IDs opened as two separate CameraDevices. logicalChars is set to the
+     * WIDE characteristics so code that reads the timestamp source from it keeps
+     * working; the LOGICAL_MULTI_CAMERA capability check is skipped entirely.
+     *
+     * Size policy: everything is capped at the mandatory CONCURRENT limit
+     * (1920x1440) — see recomputeStillSizesLocked()/recomputeRecordSizeLocked().
+     * 2x does not exist on the Moto: wide2x is always null.
+     */
+    private fun selectDualCharacteristicsAndSizes(rig: LensDiscovery.StereoRig) {
+        isDualDevice = true
+        logicalRearId = rig.wide1xId
+        wide1xPhysicalId = rig.wide1xId
+        ultraPhysicalId = rig.ultraId
+        wide2xPhysicalId = null
+        hasWide2xPhysical = false
+        phoneIsAPixel = false
+        // Lenses are stacked vertically on the back: landscape, like Samsung.
+        // displayRotation is NOT forced here anymore (0.76.5): the activity
+        // runs in sensorLandscape and passes the real rotation (90 or 270),
+        // which is what the JPEG/MP4 hints and per-frame rotation use.
+        // Zoom is crop zoom now, so a persisted 2x stays on.
+        widePhysicalId = wide1xPhysicalId
+
+        wideChars = cameraManager.getCameraCharacteristics(widePhysicalId)
+        ultraChars = cameraManager.getCameraCharacteristics(ultraPhysicalId)
+        // Stand-in for "logical" characteristics (timestamp source, etc.).
+        logicalChars = wideChars
+
+        val wide = requireNotNull(wideChars)
+        val ultra = requireNotNull(ultraChars)
+
+        sensorOrientation = wide.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+
+        // Ultrawide 3A fraction: how much of the ultrawide frame the wide view covers.
+        // scale = (f_wide / f_ultra) * (sensorW_ultra / sensorW_wide); fraction = 1/scale.
+        // Moto G Stylus 2026: (5.56/2.13) * (4.6592/8.224) ≈ 1.48 → fraction ≈ 0.68.
+        // This matches the stock fallback (0.66) and the FOV ratio
+        // tan(73°/2)/tan(95.1°/2) ≈ 0.68, so the existing SBS alignment scale (1/0.66
+        // ≈ 1.51x) already matches this phone — no aligner change needed.
+        ultra3aFraction = try {
+            val wFocal = rig.wideFocalMm ?: 5.56f
+            val uFocal = rig.ultraFocalMm ?: 2.13f
+            val wSize = wide.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            val uSize = ultra.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            if (wFocal > 0f && uFocal > 0f && wSize != null && uSize != null &&
+                wSize.width > 0f && uSize.width > 0f
+            ) {
+                val scale = (wFocal / uFocal) * (uSize.width / wSize.width)
+                (1.0f / scale).coerceIn(0.45f, 0.90f)
+            } else {
+                ULTRA_3A_FRACTION_DEFAULT
+            }
+        } catch (_: Exception) {
+            ULTRA_3A_FRACTION_DEFAULT
+        }
+        Log.i(TAG, "Moto dual-device rig: wide=$widePhysicalId ultra=$ultraPhysicalId " +
+            "ultra3aFraction=$ultra3aFraction sensorOrientation=$sensorOrientation")
+
+        wideMap = wide.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        ultraMap = ultra.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        requireNotNull(wideMap)
+        requireNotNull(ultraMap)
+
+        recomputeRecordSizeLocked()
+        recomputePreviewSizeLocked()
+        recomputeStillSizesLocked()
+    }
+
     private fun openCamera() {
         val handler = requireNotNull(cameraHandler)
+        if (isDualDevice) {
+            openDualCameras(handler)
+            return
+        }
         try {
             cameraManager.openCamera(logicalRearId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
@@ -1101,6 +1736,69 @@ class StereoCameraController(
         }
     }
 
+    /**
+     * MOTO dual-device open: wide first, then ultrawide. The two cameras are
+     * independent HAL pipelines — if the second open disconnects the first (some
+     * phones refuse concurrent opens despite the direct-open test passing), the
+     * error surfaces here and the user gets a clear message instead of a hang.
+     * Preview sessions are created only once BOTH devices are open.
+     */
+    private fun openDualCameras(handler: Handler) {
+        try {
+            dualUltraOpening = false
+            cameraManager.openCamera(widePhysicalId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    cameraDevice = camera
+                    Log.i(TAG, "Moto dual: wide camera $widePhysicalId opened, opening ultra $ultraPhysicalId")
+                    dualUltraOpening = true
+                    try {
+                        cameraManager.openCamera(ultraPhysicalId, object : CameraDevice.StateCallback() {
+                            override fun onOpened(ultraCamera: CameraDevice) {
+                                dualUltraOpening = false
+                                ultraCameraDevice = ultraCamera
+                                Log.i(TAG, "Moto dual: ultra camera $ultraPhysicalId opened")
+                                createPreviewSession()
+                            }
+
+                            override fun onDisconnected(ultraCamera: CameraDevice) {
+                                dualUltraOpening = false
+                                try { ultraCamera.close() } catch (_: Exception) {}
+                                ultraCameraDevice = null
+                                callback.onError("Ultrawide camera disconnected (Moto dual-device).")
+                            }
+
+                            override fun onError(ultraCamera: CameraDevice, error: Int) {
+                                dualUltraOpening = false
+                                try { ultraCamera.close() } catch (_: Exception) {}
+                                ultraCameraDevice = null
+                                callback.onError("Ultrawide camera error: $error (Moto dual-device).")
+                            }
+                        }, handler)
+                    } catch (e: Exception) {
+                        dualUltraOpening = false
+                        callback.onError("Opening ultrawide camera failed: ${e.message}")
+                    }
+                }
+
+                override fun onDisconnected(camera: CameraDevice) {
+                    try { camera.close() } catch (_: Exception) {}
+                    cameraDevice = null
+                    callback.onError("Wide camera disconnected (Moto dual-device).")
+                }
+
+                override fun onError(camera: CameraDevice, error: Int) {
+                    try { camera.close() } catch (_: Exception) {}
+                    cameraDevice = null
+                    callback.onError("Wide camera error: $error (Moto dual-device).")
+                }
+            }, handler)
+        } catch (se: SecurityException) {
+            callback.onError("Missing CAMERA permission.")
+        } catch (e: Exception) {
+            callback.onError("openCamera failed: ${e.message}")
+        }
+    }
+
     private fun createPreviewSession() {
 
         // make sure preview aspect doesn't get messed up
@@ -1109,6 +1807,11 @@ class StereoCameraController(
         val camera = cameraDevice ?: return
         val handler = requireNotNull(cameraHandler)
         val preview = previewSurface ?: return
+
+        if (isDualDevice) {
+            createDualPreviewSessions()
+            return
+        }
 
         try { session?.close() } catch (_: Exception) {}
         session = null
@@ -1119,7 +1822,7 @@ class StereoCameraController(
 
         closeReaders()
 
-        val raw = if (!phoneIsAPixel && isRawMode) {
+        val raw = if (!phoneIsAPixel && !isDualDevice && isRawMode) {
             callback.onStatus("RAW/DNG disabled on Samsung for now (YUV only).")
             isRawMode = false
             false
@@ -1209,6 +1912,139 @@ class StereoCameraController(
     }
 
 
+    /**
+     * MOTO dual-device preview: two independent sessions.
+     *  - Wide session: preview Surface + wide ImageReader. Repeating request is the
+     *    normal preview (preview target only).
+     *  - Ultra session: ultra ImageReader only. Its repeating request targets the
+     *    reader surface so the ultrawide keeps running continuous AF/AE while idle
+     *    (otherwise the first still capture would be slow / out of focus). Frames
+     *    arriving with no photo in flight are discarded by onStillImageAvailable().
+     * No setPhysicalCameraId() anywhere — these are standalone devices.
+     */
+    private fun createDualPreviewSessions() {
+        val wideCamera = cameraDevice ?: return
+        val ultraCamera = ultraCameraDevice ?: return
+        val handler = requireNotNull(cameraHandler)
+        val preview = previewSurface ?: return
+
+        try { session?.close() } catch (_: Exception) {}
+        session = null
+        repeatingBuilder = null
+        recordCaptureCallback = null
+        try { ultraSession?.close() } catch (_: Exception) {}
+        ultraSession = null
+        ultraRepeatingBuilder = null
+
+        cancelPrimeUwLocked()
+        closeReaders()
+
+        val raw = isRawMode
+        val (format, wideSize, ultraSize) = if (raw) {
+            val w = rawWideSize
+            val u = rawUltraSize
+            if (w != null && u != null) {
+                Triple(ImageFormat.RAW_SENSOR, w, u)
+            } else {
+                callback.onStatus("RAW not supported; using YUV.")
+                isRawMode = false
+                Triple(ImageFormat.YUV_420_888, yuvWideSize, yuvUltraSize)
+            }
+        } else {
+            Triple(ImageFormat.YUV_420_888, yuvWideSize, yuvUltraSize)
+        }
+
+        val maxImages = if (format == ImageFormat.RAW_SENSOR) RAW_MAX_IMAGES else YUV_MAX_IMAGES
+
+        wideReader = ImageReader.newInstance(wideSize.width, wideSize.height, format, maxImages).apply {
+            setOnImageAvailableListener({ reader -> onStillImageAvailable(isWide = true, reader = reader) }, handler)
+        }
+        ultraReader = ImageReader.newInstance(ultraSize.width, ultraSize.height, format, maxImages).apply {
+            setOnImageAvailableListener({ reader -> onStillImageAvailable(isWide = false, reader = reader) }, handler)
+        }
+
+        // --- Wide session: preview + wide still reader ---
+        val wideOutputs = ArrayList<OutputConfiguration>(2).apply {
+            add(OutputConfiguration(preview))
+            add(OutputConfiguration(requireNotNull(wideReader).surface))
+        }
+        wideCamera.createCaptureSessionByOutputConfigurations(
+            wideOutputs,
+            object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(sess: CameraCaptureSession) {
+                    session = sess
+                    try {
+                        val builder = wideCamera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                            addTarget(preview)
+                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                            set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                            applyCommonNoCropNoStab(this, isVideo = false, targetFps = previewTargetFps, applyFpsRange = false)
+                            applyZoomCrop(this, wideChars)
+                            try { set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF) } catch (_: Exception) {}
+                            try { set(CaptureRequest.DISTORTION_CORRECTION_MODE, CaptureRequest.DISTORTION_CORRECTION_MODE_OFF) } catch (_: Exception) {}
+                            try { set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF) } catch (_: Exception) {}
+                            applyTorch(this)
+                        }
+                        repeatingBuilder = builder
+                        sess.setRepeatingRequest(builder.build(), null, handler)
+                        if (primeUwOnActiveEnabled) {
+                            primeUwPending = true
+                            handler.removeCallbacks(primeUwRunnable)
+                            handler.post(primeUwRunnable)
+                        }
+                    } catch (e: Exception) {
+                        callback.onError("Wide preview repeating request failed: ${e.message}")
+                        Log.e(TAG, "Wide preview repeating request failed: ${e.message}", e)
+                    }
+                }
+
+                override fun onConfigureFailed(sess: CameraCaptureSession) {
+                    callback.onError("Wide preview session configure failed (Moto dual-device).")
+                }
+            },
+            handler
+        )
+
+        // --- Ultra session: ultra still reader only ---
+        val ultraOutputs = ArrayList<OutputConfiguration>(1).apply {
+            add(OutputConfiguration(requireNotNull(ultraReader).surface))
+        }
+        ultraCamera.createCaptureSessionByOutputConfigurations(
+            ultraOutputs,
+            object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(sess: CameraCaptureSession) {
+                    ultraSession = sess
+                    try {
+                        val ultraSurface = requireNotNull(ultraReader).surface
+                        val builder = ultraCamera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                            addTarget(ultraSurface)
+                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                            set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                            applyCommonNoCropNoStab(this, isVideo = false, targetFps = previewTargetFps, applyFpsRange = false, forUltraDevice = true)
+                            applyZoomCrop(this, ultraChars)
+                            try { set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF) } catch (_: Exception) {}
+                            try { set(CaptureRequest.DISTORTION_CORRECTION_MODE, CaptureRequest.DISTORTION_CORRECTION_MODE_OFF) } catch (_: Exception) {}
+                            try { set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF) } catch (_: Exception) {}
+                            // No torch on the ultra builder: the flash is shared with the
+                            // wide camera and is already driven from the wide session.
+                        }
+                        ultraRepeatingBuilder = builder
+                        sess.setRepeatingRequest(builder.build(), null, handler)
+                    } catch (e: Exception) {
+                        callback.onError("Ultra preview repeating request failed: ${e.message}")
+                        Log.e(TAG, "Ultra preview repeating request failed: ${e.message}", e)
+                    }
+                }
+
+                override fun onConfigureFailed(sess: CameraCaptureSession) {
+                    callback.onError("Ultra preview session configure failed (Moto dual-device).")
+                }
+            },
+            handler
+        )
+    }
+
+
     // ---------------------------------------------------------------------------------------------
     // Ultrawide priming (optional)
     // ---------------------------------------------------------------------------------------------
@@ -1240,6 +2076,11 @@ class StereoCameraController(
             handler.postDelayed(primeUwRunnable, 200L)
             return
         }
+        // Dual-device: the prime capture runs on the ultra device/session.
+        if (isDualDevice && (ultraCameraDevice == null || ultraSession == null)) {
+            handler.postDelayed(primeUwRunnable, 200L)
+            return
+        }
 
         // Don't interfere with real still capture.
         if (currentPhoto != null || primeUwInFlight) {
@@ -1252,8 +2093,10 @@ class StereoCameraController(
     }
 
     private fun doUltrawidePrimeCaptureLocked() {
-        val camera = cameraDevice ?: return
-        val sess = session ?: return
+        // Dual-device: prime on the standalone ultra camera/session; logical mode
+        // primes through the logical camera/session with the ultra reader as target.
+        val camera = if (isDualDevice) ultraCameraDevice ?: return else cameraDevice ?: return
+        val sess = if (isDualDevice) ultraSession ?: return else session ?: return
         val handler = cameraHandler ?: return
 
         // Target the existing ultrawide still reader. Image is discarded because currentPhoto == null.
@@ -1310,6 +2153,11 @@ class StereoCameraController(
 
         // make sure preview aspect doesn't get messed up
         surfaceTexture?.setDefaultBufferSize(previewSize.width, previewSize.height)
+
+        if (isDualDevice) {
+            createDualRecordingSessions()
+            return
+        }
 
         val camera = cameraDevice ?: return
         val handler = requireNotNull(cameraHandler)
@@ -1450,11 +2298,342 @@ class StereoCameraController(
         )
     }
 
+    /**
+     * MOTO dual-device recording: two independent recording sessions, one per camera.
+     *  - Wide session: preview + wide encoder surface.
+     *  - Ultra session: ultra encoder surface only.
+     * Both repeating requests are started back-to-back once both sessions are
+     * configured, so the two streams start as close together as the HAL allows.
+     * There is no hardware frame sync between the two pipelines — the per-frame
+     * sensor timestamps in the optional JSON log are how you measure the drift.
+     * Audio capture starts after both repeating requests are running.
+     */
+    private var dualRecordWideReady: Boolean = false
+    private var dualRecordUltraReady: Boolean = false
+
+    private fun createDualRecordingSessions() {
+        surfaceTexture?.setDefaultBufferSize(previewSize.width, previewSize.height)
+
+        val wideCamera = cameraDevice ?: return
+        val ultraCamera = ultraCameraDevice ?: return
+        val handler = requireNotNull(cameraHandler)
+        val preview = previewSurface ?: return
+        val wideEnc = wideEncoder ?: return
+        val ultraEnc = ultraEncoder ?: return
+
+        try { session?.close() } catch (_: Exception) {}
+        session = null
+        repeatingBuilder = null
+        try { ultraSession?.close() } catch (_: Exception) {}
+        ultraSession = null
+        ultraRepeatingBuilder = null
+        dualRecordWideReady = false
+        dualRecordUltraReady = false
+
+        fun recordingCallbackFor(isWide: Boolean): CameraCaptureSession.CaptureCallback? {
+            if (!enableStereoRecordingLog) return null
+            val physicalId = if (isWide) widePhysicalId else ultraPhysicalId
+            val encSurface = if (isWide) wideEnc.inputSurface else ultraEnc.inputSurface
+            val label = if (isWide) "wideEncoder" else "ultraEncoder"
+            return object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    result: TotalCaptureResult
+                ) {
+                    recordingLogger?.onPhysicalCaptureResult(physicalId, result.frameNumber, result)
+                }
+
+                override fun onCaptureBufferLost(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    target: Surface,
+                    frameNumber: Long
+                ) {
+                    recordingLogger?.onBufferLost(
+                        physicalId, if (target === encSurface) label else "unknown", frameNumber
+                    )
+                }
+            }
+        }
+
+        fun maybeStartDualRecording() {
+            if (!dualRecordWideReady || !dualRecordUltraReady) return
+            val wideSess = session ?: return
+            val ultraSess = ultraSession ?: return
+            val wideBuilder = repeatingBuilder ?: return
+            val ultraBuilder = ultraRepeatingBuilder ?: return
+            try {
+                val wideCb = recordingCallbackFor(isWide = true)
+                val ultraCb = recordingCallbackFor(isWide = false)
+                recordCaptureCallback = wideCb
+                // Start wide first, ultra immediately after, on the same handler thread.
+                wideSess.setRepeatingRequest(wideBuilder.build(), wideCb, handler)
+                ultraSess.setRepeatingRequest(ultraBuilder.build(), ultraCb, handler)
+                try {
+                    audioEncoder?.startCapturing()
+                } catch (e: Exception) {
+                    callback.onError("Audio start failed: ${e.message}")
+                }
+                callback.onRecordingStarted()
+            } catch (e: Exception) {
+                callback.onError("Record repeating request failed: ${e.message}")
+                safeStopRecordingInternal(deleteOnFailure = true)
+                isRecording = false
+            }
+        }
+
+        // --- Wide recording session ---
+        val wideOutputs = ArrayList<OutputConfiguration>(2).apply {
+            add(OutputConfiguration(preview))
+            add(OutputConfiguration(wideEnc.inputSurface))
+        }
+        wideCamera.createCaptureSessionByOutputConfigurations(
+            wideOutputs,
+            object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(sess: CameraCaptureSession) {
+                    session = sess
+                    try {
+                        val builder = wideCamera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                            addTarget(preview)
+                            addTarget(wideEnc.inputSurface)
+                            applyCommonNoCropNoStab(this, isVideo = true, targetFps = requestedRecordFps)
+                            applyZoomCrop(this, wideChars)
+                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                            set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                            try { set(CaptureRequest.NOISE_REDUCTION_MODE, videoNoiseReductionMode) } catch (_: Exception) {}
+                            try { set(CaptureRequest.DISTORTION_CORRECTION_MODE, videoDistortionCorrectionMode) } catch (_: Exception) {}
+                            try { set(CaptureRequest.EDGE_MODE, videoEdgeMode) } catch (_: Exception) {}
+                            applyTorch(this)
+                        }
+                        repeatingBuilder = builder
+                        dualRecordWideReady = true
+                        maybeStartDualRecording()
+                    } catch (e: Exception) {
+                        callback.onError("Wide record repeating request failed: ${e.message}")
+                        safeStopRecordingInternal(deleteOnFailure = true)
+                        isRecording = false
+                    }
+                }
+
+                override fun onConfigureFailed(sess: CameraCaptureSession) {
+                    callback.onError("Wide recording session configure failed (Moto dual-device).")
+                    safeStopRecordingInternal(deleteOnFailure = true)
+                    isRecording = false
+                }
+            },
+            handler
+        )
+
+        // --- Ultra recording session ---
+        val ultraOutputs = ArrayList<OutputConfiguration>(1).apply {
+            add(OutputConfiguration(ultraEnc.inputSurface))
+        }
+        ultraCamera.createCaptureSessionByOutputConfigurations(
+            ultraOutputs,
+            object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(sess: CameraCaptureSession) {
+                    ultraSession = sess
+                    try {
+                        val builder = ultraCamera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                            addTarget(ultraEnc.inputSurface)
+                            applyCommonNoCropNoStab(this, isVideo = true, targetFps = requestedRecordFps, forUltraDevice = true)
+                            applyZoomCrop(this, ultraChars)
+                            set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                            set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                            try { set(CaptureRequest.NOISE_REDUCTION_MODE, videoNoiseReductionMode) } catch (_: Exception) {}
+                            try { set(CaptureRequest.DISTORTION_CORRECTION_MODE, videoDistortionCorrectionMode) } catch (_: Exception) {}
+                            try { set(CaptureRequest.EDGE_MODE, videoEdgeMode) } catch (_: Exception) {}
+                            // No torch on the ultra builder (shared flash, driven by wide).
+                        }
+                        ultraRepeatingBuilder = builder
+                        dualRecordUltraReady = true
+                        maybeStartDualRecording()
+                    } catch (e: Exception) {
+                        callback.onError("Ultra record repeating request failed: ${e.message}")
+                        safeStopRecordingInternal(deleteOnFailure = true)
+                        isRecording = false
+                    }
+                }
+
+                override fun onConfigureFailed(sess: CameraCaptureSession) {
+                    callback.onError("Ultra recording session configure failed (Moto dual-device).")
+                    safeStopRecordingInternal(deleteOnFailure = true)
+                    isRecording = false
+                }
+            },
+            handler
+        )
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Still capture
     // ---------------------------------------------------------------------------------------------
 
+    /**
+     * MOTO dual-device still capture: one TEMPLATE_STILL_CAPTURE per camera, submitted
+     * back-to-back on the camera thread so the two exposures start as close together
+     * as the two HAL pipelines allow. Each callback stores its own TotalCaptureResult
+     * (cap.wideResult / cap.ultraResult); tryFinalizePhotoIfReady() pairs them up.
+     * There is no hardware sync here — the JSON log / toast report the real
+     * sensor-timestamp delta so you can see it per shot.
+     */
+    private fun doStillCaptureDual(raw: Boolean) {
+        val wideCamera = cameraDevice ?: return
+        val ultraCamera = ultraCameraDevice ?: return
+        val wideSess = session ?: return
+        val ultraSess = ultraSession ?: return
+        val handler = requireNotNull(cameraHandler)
+
+        val wideR = wideReader ?: run {
+            callback.onError("Wide ImageReader not ready.")
+            callback.onPhotoCaptureDone()
+            return
+        }
+        val ultraR = ultraReader ?: run {
+            callback.onError("Ultra ImageReader not ready.")
+            callback.onPhotoCaptureDone()
+            return
+        }
+
+        val preview = previewSurface
+        val capAtStart = currentPhoto
+
+        fun buildStillBuilder(
+            camera: CameraDevice,
+            targetReader: ImageReader,
+            includePreview: Boolean,
+            forUltra: Boolean
+        ): CaptureRequest.Builder {
+            return camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                if (includePreview && preview != null) addTarget(preview)
+                addTarget(targetReader.surface)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                try { set(CaptureRequest.DISTORTION_CORRECTION_MODE, photoDistortionCorrectionMode) } catch (_: Exception) {}
+                try { set(CaptureRequest.NOISE_REDUCTION_MODE, photoNoiseReductionMode) } catch (_: Exception) {}
+                try { set(CaptureRequest.EDGE_MODE, photoEdgeMode) } catch (_: Exception) {}
+                if (raw) {
+                    try {
+                        set(
+                            CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE,
+                            CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON
+                        )
+                    } catch (_: Exception) {}
+                }
+                set(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_DISABLED)
+                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                applyCommonNoCropNoStab(this, isVideo = false, targetFps = previewTargetFps, applyFpsRange = false, forUltraDevice = forUltra)
+                // Dual-device crop zoom: same relative crop on both lenses.
+                applyZoomCrop(this, if (forUltra) ultraChars else wideChars)
+                // Torch only from the wide builder (shared flash).
+                if (!forUltra) applyTorch(this)
+            }
+        }
+
+        fun resumeRepeating(sess: CameraCaptureSession, builder: CaptureRequest.Builder?) {
+            try {
+                val rb = builder ?: return
+                sess.setRepeatingRequest(rb.build(), null, handler)
+            } catch (_: Exception) {}
+        }
+
+        try {
+            try { wideSess.stopRepeating() } catch (_: Exception) {}
+            try { ultraSess.stopRepeating() } catch (_: Exception) {}
+
+            val wideBuilder = buildStillBuilder(wideCamera, wideR, includePreview = true, forUltra = false)
+            val ultraBuilder = buildStillBuilder(ultraCamera, ultraR, includePreview = false, forUltra = true)
+
+            wideSess.capture(
+                wideBuilder.build(),
+                object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(
+                        session: CameraCaptureSession,
+                        request: CaptureRequest,
+                        result: TotalCaptureResult
+                    ) {
+                        val cap = currentPhoto
+                        if (cap != null) {
+                            cap.wideResult = result
+                            cap.totalResult = result
+                            tryFinalizePhotoIfReady()
+                        }
+                    }
+
+                    override fun onCaptureFailed(
+                        session: CameraCaptureSession,
+                        request: CaptureRequest,
+                        failure: CaptureFailure
+                    ) {
+                        callback.onError("Wide still capture failed: $failure")
+                        failAndCleanupCurrentPhoto()
+                    }
+
+                    override fun onCaptureSequenceCompleted(session: CameraCaptureSession, sequenceId: Int, frameNumber: Long) {
+                        resumeRepeating(session, repeatingBuilder)
+                    }
+                },
+                handler
+            )
+
+            // Back-to-back: submit the ultra capture immediately after the wide one.
+            ultraSess.capture(
+                ultraBuilder.build(),
+                object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(
+                        session: CameraCaptureSession,
+                        request: CaptureRequest,
+                        result: TotalCaptureResult
+                    ) {
+                        val cap = currentPhoto
+                        if (cap != null) {
+                            cap.ultraResult = result
+                            tryFinalizePhotoIfReady()
+                        }
+                    }
+
+                    override fun onCaptureFailed(
+                        session: CameraCaptureSession,
+                        request: CaptureRequest,
+                        failure: CaptureFailure
+                    ) {
+                        callback.onError("Ultra still capture failed: $failure")
+                        failAndCleanupCurrentPhoto()
+                    }
+
+                    override fun onCaptureSequenceCompleted(session: CameraCaptureSession, sequenceId: Int, frameNumber: Long) {
+                        resumeRepeating(session, ultraRepeatingBuilder)
+                    }
+                },
+                handler
+            )
+
+            // Watchdog: never leave UI stuck if one camera fails to deliver.
+            handler.postDelayed({
+                val capNow = currentPhoto
+                if (capNow != null && capNow === capAtStart && !capNow.finished) {
+                    Log.e(
+                        TAG,
+                        "Moto dual still timeout: wideReady=${capNow.wideImage != null}, ultraReady=${capNow.ultraImage != null}"
+                    )
+                    callback.onError("Still capture timed out on this device.")
+                    failAndCleanupCurrentPhoto()
+                    try { resumeRepeating(wideSess, repeatingBuilder) } catch (_: Exception) {}
+                    try { resumeRepeating(ultraSess, ultraRepeatingBuilder) } catch (_: Exception) {}
+                }
+            }, 2500L)
+        } catch (e: Exception) {
+            callback.onError("Still capture exception: ${e.message}")
+            failAndCleanupCurrentPhoto()
+        }
+    }
+
     private fun doStillCapture(raw: Boolean) {
+        if (isDualDevice) {
+            doStillCaptureDual(raw)
+            return
+        }
         val camera = cameraDevice ?: return
         val sess = session ?: return
         val handler = requireNotNull(cameraHandler)
@@ -1645,9 +2824,15 @@ class StereoCameraController(
         // For RAW, we always need the TotalCaptureResult to build DNG.
         // For YUV, we only need the TotalCaptureResult if we want exposure-time-based sync metrics
         // (photo JSON log / photo sync toast).
+        // Dual-device: each camera delivers its own result, so both must be present.
         val needResult = cap.isRaw || cap.logUri != null || enablePhotoSyncToast
         val ready = if (needResult) {
-            (wideImgNullable != null && ultraImgNullable != null && totalResultNullable != null)
+            if (isDualDevice) {
+                (wideImgNullable != null && ultraImgNullable != null &&
+                    cap.wideResult != null && cap.ultraResult != null)
+            } else {
+                (wideImgNullable != null && ultraImgNullable != null && totalResultNullable != null)
+            }
         } else {
             (wideImgNullable != null && ultraImgNullable != null)
         }
@@ -1664,7 +2849,8 @@ class StereoCameraController(
 
         val wideUri = cap.wideUri
         val ultraUri = cap.ultraUri
-        val sbsUri = cap.sbsUri
+        val sbsMatchedWideUri = cap.sbsMatchedWideUri
+        val sbsMatchedUltraUri = cap.sbsMatchedUltraUri
         val photoLogUri = cap.logUri
 
         val captureId = cap.captureId
@@ -1684,8 +2870,12 @@ class StereoCameraController(
             emptyMap()
         }
 
-        val wideResultForMetrics: CaptureResult? = physicalForMetrics[widePhysicalId] ?: totalResultNullable
-        val ultraResultForMetrics: CaptureResult? = physicalForMetrics[ultraPhysicalId] ?: totalResultNullable
+        // Dual-device: per-lens results win; logical mode: physical results from the
+        // logical TotalCaptureResult, falling back to the logical result itself.
+        val wideResultForMetrics: CaptureResult? = cap.wideResult
+            ?: physicalForMetrics[widePhysicalId] ?: totalResultNullable
+        val ultraResultForMetrics: CaptureResult? = cap.ultraResult
+            ?: physicalForMetrics[ultraPhysicalId] ?: totalResultNullable
 
         val wideSensorTimestampNs = wideResultForMetrics?.get(CaptureResult.SENSOR_TIMESTAMP)
             ?: (wideImageTimestampNs ?: 0L)
@@ -1822,36 +3012,71 @@ class StereoCameraController(
                 }
             }
 
-            // Always produce SBS
-            if (sbsUri != null) {
-                val sbsOutUri = sbsUri
+            // Produce only the two color-matched SBS versions (the plain
+            // unmatched SBS is not saved anymore). The aligned SBS bytes are
+            // still built in memory first; the matched variants are derived
+            // from them with identical alignment, only colors changed.
+            if (sbsMatchedWideUri != null || sbsMatchedUltraUri != null) {
                 sbsExecutor.execute {
                     try {
                         val zoom2xForThisSbs = zoom2xAtCapture
+                        val sbsView =
+                            StereoSbs.SbsView.fromSetting(AppSettings.getSbsView(context))
                         val sbsBytes = StereoSbs.alignAndCreateSbsJpegBytes(
-                            wideRight = wideFrame,
-                            ultraLeft = ultraFrame,
-                            zoom2xEnabled = zoom2xForThisSbs,
-                            fallbackUltraOverlapFraction = ultra3aFraction
+                            wideFrame = wideFrame,
+                            ultraFrame = ultraFrame,
+                            // Dual-device crop zoom already cropped BOTH lenses
+                            // identically, so the aligner must NOT do its extra
+                            // ultra crop (that crop is only for the logical-mode
+                            // physical 2x wide, where the ultra stays full).
+                            zoom2xEnabled = zoom2xForThisSbs && !isDualDevice,
+                            fallbackUltraOverlapFraction = ultra3aFraction,
+                            sbsView = sbsView
                         )
 
                         if (sbsBytes == null) {
-                            Log.w(TAG, "SBS creation failed; deleting sbs pending URI")
-                            MediaStoreUtils.delete(resolver, sbsOutUri)
+                            Log.w(TAG, "SBS creation failed; deleting matched sbs pending URIs")
+                            sbsMatchedWideUri?.let { MediaStoreUtils.delete(resolver, it) }
+                            sbsMatchedUltraUri?.let { MediaStoreUtils.delete(resolver, it) }
                             return@execute
                         }
 
-                        ImageWriters.writeJpegWithExif(
-                            context = context,
-                            uri = sbsOutUri,
-                            bytes = sbsBytes,
-                            exifDateTimeOriginal = exifDt,
-                            exifOrientation = PlatformExif.ORIENTATION_NORMAL
-                        )
-                        MediaStoreUtils.finalizePending(resolver, sbsOutUri)
+                        val (matchedToWide, matchedToUltra) =
+                            StereoSbs.createColorMatchedSbsVariants(sbsBytes, sbsView)
+
+                        if (sbsMatchedWideUri != null) {
+                            if (matchedToWide != null) {
+                                ImageWriters.writeJpegWithExif(
+                                    context = context,
+                                    uri = sbsMatchedWideUri,
+                                    bytes = matchedToWide,
+                                    exifDateTimeOriginal = exifDt,
+                                    exifOrientation = PlatformExif.ORIENTATION_NORMAL
+                                )
+                                MediaStoreUtils.finalizePending(resolver, sbsMatchedWideUri)
+                            } else {
+                                MediaStoreUtils.delete(resolver, sbsMatchedWideUri)
+                            }
+                        }
+
+                        if (sbsMatchedUltraUri != null) {
+                            if (matchedToUltra != null) {
+                                ImageWriters.writeJpegWithExif(
+                                    context = context,
+                                    uri = sbsMatchedUltraUri,
+                                    bytes = matchedToUltra,
+                                    exifDateTimeOriginal = exifDt,
+                                    exifOrientation = PlatformExif.ORIENTATION_NORMAL
+                                )
+                                MediaStoreUtils.finalizePending(resolver, sbsMatchedUltraUri)
+                            } else {
+                                MediaStoreUtils.delete(resolver, sbsMatchedUltraUri)
+                            }
+                        }
                     } catch (e: Exception) {
-                        Log.e(TAG, "SBS creation failed: ${e.message}", e)
-                        MediaStoreUtils.delete(resolver, sbsOutUri)
+                        Log.e(TAG, "Color-matched SBS creation failed: ${e.message}", e)
+                        sbsMatchedWideUri?.let { MediaStoreUtils.delete(resolver, it) }
+                        sbsMatchedUltraUri?.let { MediaStoreUtils.delete(resolver, it) }
                     }
                 }
             }
@@ -1884,7 +3109,9 @@ class StereoCameraController(
                             )
                         } catch (e: Exception) {
                             // Some devices may omit keys in physical results; retry with logical metadata.
-                            if (wideResultForDng !== total) {
+                            // Dual-device: there is no logical metadata, and `total` is the
+                            // WIDE result — never use it for the ultra DNG. No retry there.
+                            if (!isDualDevice && wideResultForDng !== total) {
                                 Log.w(TAG, "Wide DNG write failed with physical metadata; retrying with logical metadata: ${e.message}")
                                 DngWriter.writeDng(
                                     context = context,
@@ -1915,7 +3142,9 @@ class StereoCameraController(
                             )
                         } catch (e: Exception) {
                             // Some devices may omit keys in physical results; retry with logical metadata.
-                            if (ultraResultForDng !== total) {
+                            // Dual-device: no logical metadata exists — never retry the ultra
+                            // DNG with the wide result. No retry there.
+                            if (!isDualDevice && ultraResultForDng !== total) {
                                 Log.w(TAG, "Ultra DNG write failed with physical metadata; retrying with logical metadata: ${e.message}")
                                 DngWriter.writeDng(
                                     context = context,
@@ -1985,8 +3214,9 @@ class StereoCameraController(
         cap.wideUri?.let { MediaStoreUtils.delete(resolver, it) }
         cap.ultraUri?.let { MediaStoreUtils.delete(resolver, it) }
 
-        // so we don’t leave a dangling pending _sbs.jpg entry
-        cap.sbsUri?.let { MediaStoreUtils.delete(resolver, it) }
+        // so we don’t leave dangling pending _sbs_matched_*.jpg entries
+        cap.sbsMatchedWideUri?.let { MediaStoreUtils.delete(resolver, it) }
+        cap.sbsMatchedUltraUri?.let { MediaStoreUtils.delete(resolver, it) }
 
         // so we don’t leave a dangling pending _photo.json entry
         cap.logUri?.let { MediaStoreUtils.delete(resolver, it) }
@@ -2039,7 +3269,7 @@ class StereoCameraController(
         return r
     }
 
-    private fun applyUltrawide3ARegions(builder: CaptureRequest.Builder) {
+    private fun applyUltrawide3ARegions(builder: CaptureRequest.Builder, forUltraDevice: Boolean = false) {
 
         // constrain ultrawide 3A to overlap-ish center region
 
@@ -2064,6 +3294,23 @@ class StereoCameraController(
 
         val region = MeteringRectangle(rect, MeteringRectangle.METERING_WEIGHT_MAX)
         val regions = arrayOf(region)
+
+        if (isDualDevice) {
+            // Standalone ultra device: set the regions directly on its own builder.
+            // On a WIDE builder in dual mode, do nothing — the wide metering must
+            // stay full-frame.
+            if (!forUltraDevice) return
+            if (maxAf > 0) {
+                try { builder.set(CaptureRequest.CONTROL_AF_REGIONS, regions) } catch (_: Exception) {}
+            }
+            if (maxAe > 0) {
+                try { builder.set(CaptureRequest.CONTROL_AE_REGIONS, regions) } catch (_: Exception) {}
+            }
+            if (maxAwb > 0) {
+                try { builder.set(CaptureRequest.CONTROL_AWB_REGIONS, regions) } catch (_: Exception) {}
+            }
+            return
+        }
 
         // set the AF/AE/AWB regions if supported
         // (number of regions > 0 since we want to use 1 region)
@@ -2130,9 +3377,26 @@ class StereoCameraController(
         return modes.contains(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
     }
 
-    private fun applyOisAlwaysOnIfSupported(builder: CaptureRequest.Builder) {
+    private fun applyOisAlwaysOnIfSupported(builder: CaptureRequest.Builder, forUltraDevice: Boolean = false) {
         // OIS: always request ON (where supported).
         // Note: some lenses (e.g., Pixel 7 Pro ultrawide) have no OIS and will remain off.
+
+        if (isDualDevice) {
+            // Standalone device: enable OIS only if THIS device's lens supports it.
+            // (Moto G Stylus 2026 reports no OIS modes on either lens via Camera2,
+            // so this is a no-op there — the plain set() is never attempted.)
+            val chars = if (forUltraDevice) ultraChars else wideChars
+            if (supportsOis(chars)) {
+                try {
+                    builder.set(
+                        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
+                    )
+                } catch (_: Exception) {
+                }
+            }
+            return
+        }
 
         try {
             if (supportsOis(logicalChars)) {
@@ -2162,7 +3426,7 @@ class StereoCameraController(
         }
     }
 
-    private fun applyCommonNoCropNoStab(builder: CaptureRequest.Builder, isVideo: Boolean, targetFps: Int, applyFpsRange: Boolean = true) {
+    private fun applyCommonNoCropNoStab(builder: CaptureRequest.Builder, isVideo: Boolean, targetFps: Int, applyFpsRange: Boolean = true, forUltraDevice: Boolean = false) {
 
         // EIS toggle (video only)
         if (isVideo && eisEnabled) {
@@ -2178,7 +3442,7 @@ class StereoCameraController(
         }
 
         // OIS is always requested ON (where supported).
-        applyOisAlwaysOnIfSupported(builder)
+        applyOisAlwaysOnIfSupported(builder, forUltraDevice)
 
         if (applyFpsRange) {
             // AE target FPS range.
@@ -2189,6 +3453,10 @@ class StereoCameraController(
                 if (isVideo) {
                     chooseCommonAeFpsRange(targetFps)
                         ?: chooseAeFpsRange(logicalChars, targetFps)
+                } else if (isDualDevice && forUltraDevice) {
+                    // Dual-device ultra preview: the ultra device needs its own range.
+                    chooseAeFpsRange(ultraChars, targetFps)
+                        ?: chooseAeFpsRange(wideChars, targetFps)
                 } else {
                     chooseAeFpsRange(wideChars, targetFps)
                         ?: chooseAeFpsRange(logicalChars, targetFps)
@@ -2206,7 +3474,7 @@ class StereoCameraController(
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
 
         // constrain ultrawide 3A to overlap-ish center region
-        applyUltrawide3ARegions(builder)
+        applyUltrawide3ARegions(builder, forUltraDevice)
     }
 
     private fun <T> setPhysical(builder: CaptureRequest.Builder, physicalId: String, key: CaptureRequest.Key<T>, value: T) {
@@ -2266,13 +3534,28 @@ class StereoCameraController(
     }
 
     private fun safeStopRecordingInternal(deleteOnFailure: Boolean) {
+        // Direct mode (0.77.0): stop the recorder and drop its partial file.
+        // releaseDirectState also closes the sessions; the closes below are
+        // harmless repeats for the two-stream path.
+        if (isDirectRecording) {
+            releaseDirectState()
+        }
+
         // Stop session output
         try { session?.stopRepeating() } catch (_: Exception) {}
         try { session?.abortCaptures() } catch (_: Exception) {}
         try { session?.close() } catch (_: Exception) {}
+        // Dual-device: stop the ultrawide session too.
+        try { ultraSession?.stopRepeating() } catch (_: Exception) {}
+        try { ultraSession?.abortCaptures() } catch (_: Exception) {}
+        try { ultraSession?.close() } catch (_: Exception) {}
 
         session = null
         repeatingBuilder = null
+        ultraSession = null
+        ultraRepeatingBuilder = null
+        dualRecordWideReady = false
+        dualRecordUltraReady = false
         recordCaptureCallback = null
 
         val resolver = context.contentResolver
@@ -2304,6 +3587,7 @@ class StereoCameraController(
         val uUri = ultraVideoUri
         wideVideoUri = null
         ultraVideoUri = null
+        currentRecordingId = null
 
         if (wUri != null && uUri != null) {
             if (deleteOnFailure) {

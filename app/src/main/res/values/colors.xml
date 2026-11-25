@@ -3,9 +3,11 @@
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
 
-    <color name="red">#FFD32F2F</color>
-    <color name="green">#FF2E7D32</color>
-
-    <color name="gray">#FF808080</color>
-    <color name="dark_gray">#FF202020</color>
+    <!-- 0.76.5: neutral Moto-style camera palette. No loud green/red:
+         the shutter is white, controls are dark charcoal, and the only
+         accent is a muted dusty blue-gray for the recording indicator. -->
+    <color name="shutter_white">#FFFFFFFF</color>
+    <color name="control_dark">#FF1C1C1E</color>
+    <color name="control_disabled">#FF3A3A3C</color>
+    <color name="accent_muted">#FF8FA8BF</color>
 </resources>

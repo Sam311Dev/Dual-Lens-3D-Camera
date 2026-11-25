@@ -36,6 +36,28 @@ object AppSettings {
     const val KEY_VIDEO_DISTORTION_CORRECTION = "video_distortion_correction" // "off" | "fast" | "hq"
     const val KEY_VIDEO_EDGE_MODE = "video_edge_mode" // "off" | "fast" | "hq"
 
+    // Stitched SBS video: after a recording stops, combine the wide + ultrawide
+    // Video record mode (0.77.0): "direct" records one finished side-by-side
+    // *_sbs.mp4 straight from the two lenses (Moto dual-device only, with a
+    // ~1s warm-up while the lenses settle); "stitched" (default) records two
+    // separate MP4s and stitches them after, as before.
+    const val KEY_VIDEO_RECORD_MODE = "video_record_mode"
+
+    // MP4s into one side-by-side *_sbs.mp4 (aligned + color-matched). The two
+    // separate MP4s are always kept as well.
+    const val KEY_VIDEO_STITCH_SBS = "video_stitch_sbs"
+    // Which eye the stitched SBS video's colors are synced to:
+    // "wide" (default) -> warmer, the wide lens's colors; "ultra" -> cooler,
+    // the ultrawide's colors; "off" -> keep each lens's own colors.
+    const val KEY_VIDEO_COLOR_MATCH = "video_color_match"
+
+    // SBS layout for photos and stitched SBS video: "cross" (default, as
+    // built so far — right eye on the left, view cross-eyed) or "parallel"
+    // (left eye on the left; better for video, which is harder to flip in
+    // post). Only swaps which eye goes on which side; alignment and color
+    // matching are unchanged.
+    const val KEY_SBS_VIEW = "sbs_view"
+
     const val KEY_PREVIEW_RESOLUTION = "preview_resolution"
     const val KEY_PREVIEW_FPS = "preview_fps"
 
@@ -172,6 +194,24 @@ object AppSettings {
     fun getPhotoPrimeUwOnActiveEnabled(context: Context): Boolean =
         prefs(context).getBoolean(KEY_PHOTO_PRIME_UW_ON_ACTIVE, false)
 
+    fun getVideoStitchSbsEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_VIDEO_STITCH_SBS, true)
+
+    /** "direct" or "stitched" (default). Direct is Moto dual-device only. */
+    fun getVideoRecordMode(context: Context): String =
+        prefs(context).getString(KEY_VIDEO_RECORD_MODE, "stitched") ?: "stitched"
+
+    fun isDirectRecordMode(context: Context): Boolean =
+        getVideoRecordMode(context) == "direct"
+
+    fun getVideoColorMatch(context: Context): String =
+        prefs(context).getString(KEY_VIDEO_COLOR_MATCH, "wide") ?: "wide"
+
+    fun getSbsView(context: Context): String =
+        prefs(context).getString(KEY_SBS_VIEW, "cross") ?: "cross"
+
+    fun isSbsParallel(context: Context): Boolean = getSbsView(context) == "parallel"
+
     fun getVideoNoiseReductionMode(context: Context): Int {
         return when (prefs(context).getString(KEY_VIDEO_NOISE_REDUCTION, "off")) {
             "fast" -> CaptureRequest.NOISE_REDUCTION_MODE_FAST
@@ -219,7 +259,9 @@ object AppSettings {
         val ultraChars: CameraCharacteristics,
         val ultraMap: StreamConfigurationMap,
         val wide2xChars: CameraCharacteristics?,
-        val wide2xMap: StreamConfigurationMap?
+        val wide2xMap: StreamConfigurationMap?,
+        /** True when the rig is a Moto-style dual-device rig (no logical camera). */
+        val isDualDevice: Boolean = false
     )
 
     fun loadStereoCaps(context: Context): StereoCaps? {
@@ -236,7 +278,7 @@ object AppSettings {
             val w2c = rig.wide2xId?.let { cm.getCameraCharacteristics(it) }
             val w2m = w2c?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
-            StereoCaps(w1c, w1m, uc, um, w2c, w2m)
+            StereoCaps(w1c, w1m, uc, um, w2c, w2m, isDualDevice = rig.isDualDevice)
         } catch (_: Exception) {
             null
         }
@@ -244,13 +286,18 @@ object AppSettings {
 
     /**
      * Resolutions common across the two capture lenses (wide + ultrawide).
+     * Dual-device: capped at 1920x1440 (mandatory concurrent limit while both
+     * cameras are open), even though each camera alone lists up to 4000x3000.
      */
     fun commonVideoSizes(caps: StereoCaps): List<Size> {
         val wideSizes = (caps.wide1xMap.getOutputSizes(ImageFormat.PRIVATE) ?: emptyArray()).toList()
         val ultraSizes = (caps.ultraMap.getOutputSizes(ImageFormat.PRIVATE) ?: emptyArray()).toList()
 
         val ultraSet = ultraSizes.map { it.width to it.height }.toSet()
-        val common = wideSizes.filter { ultraSet.contains(it.width to it.height) }
+        val common = wideSizes.filter {
+            ultraSet.contains(it.width to it.height) &&
+                (!caps.isDualDevice || (it.width <= 1920 && it.height <= 1440))
+        }
 
         return common.distinctBy { it.width to it.height }
             .sortedByDescending { it.width.toLong() * it.height.toLong() }
@@ -274,6 +321,7 @@ object AppSettings {
 
         return common
             .filter { SizeSelector.isFourByThree(it) }
+            .filter { !caps.isDualDevice || (it.width <= 1920 && it.height <= 1440) }
             .distinctBy { it.width to it.height }
             .sortedByDescending { it.width.toLong() * it.height.toLong() }
     }
@@ -434,6 +482,17 @@ object AppSettings {
         // default: ultrawide priming is OFF
         if (!sp.contains(KEY_PHOTO_PRIME_UW_ON_ACTIVE)) {
             editor.putBoolean(KEY_PHOTO_PRIME_UW_ON_ACTIVE, false); changed = true
+        }
+
+        // Stitched SBS video defaults: on, colors synced to the wide (warmer).
+        if (!sp.contains(KEY_VIDEO_STITCH_SBS)) {
+            editor.putBoolean(KEY_VIDEO_STITCH_SBS, true); changed = true
+        }
+        if (!sp.contains(KEY_VIDEO_COLOR_MATCH)) {
+            editor.putString(KEY_VIDEO_COLOR_MATCH, "wide"); changed = true
+        }
+        if (!sp.contains(KEY_SBS_VIEW)) {
+            editor.putString(KEY_SBS_VIEW, "cross"); changed = true
         }
 
         // Video processing defaults (recording only).

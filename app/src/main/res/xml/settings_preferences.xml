@@ -34,7 +34,7 @@
         <androidx.preference.SwitchPreferenceCompat
             android:key="photo_save_individual_images"
             android:title="Save individual wide/ultrawide photos"
-            android:summary="When off, only the *_sbs.jpg file is written (recommended)"
+            android:summary="When off, only the two color-matched *_sbs_matched_*.jpg files are written (recommended)"
             android:defaultValue="false" />
     </PreferenceCategory>
 
@@ -56,6 +56,30 @@
             android:key="video_bitrate_mbps"
             android:title="Video bitrate (Mbps)"
             android:defaultValue="50" />
+
+        <ListPreference
+            android:key="video_record_mode"
+            android:title="Video record mode"
+            android:summary="Direct records one finished side-by-side video (waits ~1s for the lenses to settle; Moto dual-device only). Two streams keeps the separate videos and stitches them after"
+            android:defaultValue="stitched" />
+
+        <androidx.preference.SwitchPreferenceCompat
+            android:key="video_stitch_sbs"
+            android:title="Stitched SBS video"
+            android:summary="After recording, combine the wide + ultrawide videos into one side-by-side *_sbs.mp4 (the two separate videos are kept too)"
+            android:defaultValue="true" />
+
+        <ListPreference
+            android:key="video_color_match"
+            android:title="SBS video color match"
+            android:summary="Which lens the stitched video's colors are synced to"
+            android:defaultValue="wide" />
+
+        <ListPreference
+            android:key="sbs_view"
+            android:title="SBS view"
+            android:summary="Cross-eyed or parallel — which eye goes on the left. Applies to SBS photos and stitched SBS video"
+            android:defaultValue="cross" />
 
         <!-- (4) Optional video request processing controls -->
         <ListPreference

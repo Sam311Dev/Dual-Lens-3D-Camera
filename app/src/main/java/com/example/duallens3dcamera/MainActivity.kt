@@ -3,7 +3,9 @@ package com.example.duallens3dcamera
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
@@ -13,13 +15,17 @@ import android.os.Looper
 import android.util.Size
 import android.view.Surface
 import android.view.TextureView
+import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.content.ContextCompat
+import com.example.duallens3dcamera.camera.LensDiscovery
 import com.example.duallens3dcamera.settings.AppSettings
 import com.example.duallens3dcamera.settings.SettingsActivity
 import com.example.duallens3dcamera.camera.StereoCameraController
+import com.example.duallens3dcamera.util.CrashLog
 import com.example.duallens3dcamera.databinding.ActivityMainBinding
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -70,6 +76,13 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
         reapplyTransformOnNextFrame = true
     }
 
+    // 0.76.5: whether the currently inflated layout is the landscape one.
+    // Set at inflation time in onCreate; onConfigurationChanged compares it
+    // against the new orientation and recreates only when they disagree
+    // (launching the Moto app while holding it portrait inflates the portrait
+    // layout, then the sensorLandscape lock flips it to landscape).
+    private var inflatedLandscape: Boolean = false
+
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -87,8 +100,22 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // 0.77.1: catch uncaught crashes to a file (Documents/StereoCapture)
+        // so a crash on her phone leaves a readable record behind.
+        CrashLog.install(this)
+
+        // 0.76.5: on the Moto the stereo pair is only correct in landscape
+        // (the lenses are stacked vertically on the back), so the activity
+        // follows the two landscape orientations and the UI text stays
+        // upright. Other phones keep the manifest's portrait lock.
+        if (LensDiscovery.isMotoStylusDevice()) {
+            requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
+
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        inflatedLandscape =
+            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
 
         controller = StereoCameraController(this, this)
 
@@ -208,14 +235,26 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
         }
     }
 
-//    override fun onResume() {
-//        super.onResume()
-//        if (!hasAllPermissions()) {
-//            requestPermissions()
-//        } else {
-//            maybeStartCamera()
-//        }
-//    }
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // 0.76.5: the Moto activity runs in sensorLandscape. A 180° flip
+        // (landscape <-> reverse landscape) keeps the same layout — just
+        // tell the controller the new rotation and re-fit the preview.
+        // A portrait <-> landscape flip means the wrong layout is inflated
+        // (only happens at launch while held portrait); recreate once so
+        // the right layout loads. This never fires mid-recording: the Moto
+        // only flips landscape <-> landscape, and other phones are locked.
+        val nowLandscape = newConfig.orientation == Configuration.ORIENTATION_LANDSCAPE
+        if (nowLandscape != inflatedLandscape) {
+            recreate()
+            return
+        }
+        controller.setDisplayRotation(display?.rotation ?: Surface.ROTATION_0)
+        binding.textureView.post {
+            configureTransform(binding.textureView.width, binding.textureView.height)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         if (!hasAllPermissions()) {
@@ -284,6 +323,9 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
         )
 
         binding.textureView.post {
+            // 0.76.6: size the preview to the preview's aspect first, then fit
+            // the transform to the resulting view size.
+            applyPreviewAspectRatio()
             configureTransform(binding.textureView.width, binding.textureView.height)
         }
     }
@@ -450,7 +492,10 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
     // ---------------- main buttons enable/disable ----------------
 
     private fun updateUi() {
-        val gray = ContextCompat.getColorStateList(this, android.R.color.darker_gray)
+        // 0.76.5: neutral Moto-style palette — no loud green/red. The photo
+        // shutter is white, everything else is dark charcoal, and the
+        // recording state is a white STOP pill.
+        val gray = ContextCompat.getColorStateList(this, R.color.control_disabled)
 
         fun setEnabledStyle(
             button: com.google.android.material.button.MaterialButton,
@@ -474,10 +519,10 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
 //        setEnabledStyle(binding.btnEis, topEnabled, android.R.color.black, android.R.color.white)
 //        setEnabledStyle(binding.btnFormat, topEnabled, android.R.color.black, android.R.color.white)
 //        setEnabledStyle(binding.btnZoom, topEnabled, android.R.color.black, android.R.color.white)
-        setEnabledStyle(binding.btnSettings, topEnabled, android.R.color.black, android.R.color.white)
-        setEnabledStyle(binding.btnEis, topEnabled, android.R.color.black, android.R.color.white)
-        setEnabledStyle(binding.btnFormat, topEnabled, android.R.color.black, android.R.color.white)
-        setEnabledStyle(binding.btnZoom, topEnabled, android.R.color.black, android.R.color.white)
+        setEnabledStyle(binding.btnSettings, topEnabled, R.color.control_dark, android.R.color.white)
+        setEnabledStyle(binding.btnEis, topEnabled, R.color.control_dark, android.R.color.white)
+        setEnabledStyle(binding.btnFormat, topEnabled, R.color.control_dark, android.R.color.white)
+        setEnabledStyle(binding.btnZoom, topEnabled, R.color.control_dark, android.R.color.white)
 
         // Re-apply EIS strike state after enable/disable styling.
         updateEisButton()
@@ -491,18 +536,26 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
             updateTorchButton()
         }
 
-        setEnabledStyle(binding.btnPhoto, enabled = (!isBusy && !isRecording), tint = android.R.color.holo_green_dark, textColor = android.R.color.white)
+        // White shutter button, black text — like a real camera app.
+        setEnabledStyle(binding.btnPhoto, enabled = (!isBusy && !isRecording), tint = R.color.shutter_white, textColor = android.R.color.black)
 
         val recordEnabled = !isBusy
         binding.btnRecord.isEnabled = recordEnabled
         binding.btnRecord.text = if (isRecording) "STOP" else "RECORD"
-        if (recordEnabled) {
-            binding.btnRecord.backgroundTintList = ContextCompat.getColorStateList(this, android.R.color.holo_red_dark)
-            binding.btnRecord.setTextColor(ContextCompat.getColor(this, android.R.color.white))
-        } else {
+        if (!recordEnabled) {
             binding.btnRecord.backgroundTintList = gray
             binding.btnRecord.setTextColor(ContextCompat.getColor(this, android.R.color.white))
+        } else if (isRecording) {
+            // Recording: white pill reading STOP (no loud red).
+            binding.btnRecord.backgroundTintList = ContextCompat.getColorStateList(this, R.color.shutter_white)
+            binding.btnRecord.setTextColor(ContextCompat.getColor(this, android.R.color.black))
+        } else {
+            binding.btnRecord.backgroundTintList = ContextCompat.getColorStateList(this, R.color.control_dark)
+            binding.btnRecord.setTextColor(ContextCompat.getColor(this, android.R.color.white))
         }
+
+        // Muted recording indicator (0.76.5).
+        binding.recIndicator.visibility = if (isRecording) View.VISIBLE else View.GONE
     }
 
     private fun timestampForFilename(): String {
@@ -532,6 +585,8 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
         toastOnUi(msg)
         isRecording = false
         isBusy = false
+        binding.stitchProgressCard.visibility = View.GONE
+        binding.stitchProgressBar.isIndeterminate = false
         updateUi()
     }
 
@@ -540,8 +595,20 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
     override fun onRecordingStarted() = onUi {
         isBusy = false
         isRecording = true
+        binding.stitchProgressCard.visibility = View.GONE
+        binding.stitchProgressBar.isIndeterminate = false
         updateUi()
         requestPreviewTransformReapply() // make sure preview still has the right aspect
+    }
+
+    // 0.77.0: direct SBS mode — the lenses are settling before encoding
+    // starts. The record button stays disabled until onRecordingStarted.
+    override fun onDirectWarmup() = onUi {
+        isBusy = true
+        updateUi()
+        binding.stitchProgressBar.isIndeterminate = true
+        binding.stitchProgressText.text = "Warming up…"
+        binding.stitchProgressCard.visibility = View.VISIBLE
     }
 
     override fun onRecordingStopped() = onUi {
@@ -555,35 +622,110 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
         updateUi()
     }
 
-    // ---------------- Preview transform (NO rotation; just aspect-preserving scale) ----------------
-    // This is the version that fixed your sideways preview.
+    // 0.76.5: background SBS stitch progress — a slim progress card over
+    // the preview, so the wait after recording isn't a mystery anymore.
+    // The camera stays usable while the stitch runs in the background.
+    override fun onStitchProgress(stage: String, done: Int, total: Int) = onUi {
+        binding.stitchProgressCard.visibility = View.VISIBLE
+        binding.stitchProgressBar.isIndeterminate = false
+        val pct = if (total > 0) (done * 100 / total).coerceIn(0, 100) else 0
+        binding.stitchProgressBar.max = 100
+        binding.stitchProgressBar.progress = pct
+        binding.stitchProgressText.text = "$stage $pct%"
+    }
+
+    override fun onStitchDone(success: Boolean, frames: Int) = onUi {
+        binding.stitchProgressBar.progress = 100
+        binding.stitchProgressText.text = if (success) {
+            "3D video saved ✓"
+        } else {
+            "Couldn't stitch — separate videos saved"
+        }
+        binding.stitchProgressCard.postDelayed(
+            { binding.stitchProgressCard.visibility = View.GONE },
+            3000
+        )
+    }
+
+    // ---------------- Preview transform ----------------
+    // 0.76.6: the Camera2Basic sample recipe, verbatim. 0.76.5 got this
+    // wrong — it mapped the buffer straight onto the landscape view with no
+    // rotation, so the preview came out sideways and stretched. The texture
+    // is portrait-effective (the camera presents it upright for the phone's
+    // natural portrait orientation, and TextureView does not rotate it for
+    // you), so a landscape view needs the sample's 90° rotation. The
+    // landscape view is aspect-matched to the preview (see
+    // applyPreviewAspectRatio), which is what keeps the fill step from
+    // distorting — the sample assumes the same. Portrait keeps the old
+    // behavior, which was verified correct.
     private fun configureTransform(viewWidth: Int, viewHeight: Int) {
         val cfg = previewConfig ?: return
         if (viewWidth <= 0 || viewHeight <= 0) return
 
         val previewSize = cfg.previewSize
+        val rotation = display?.rotation ?: Surface.ROTATION_0
 
         val matrix = Matrix()
         val viewRect = RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat())
         val centerX = viewRect.centerX()
         val centerY = viewRect.centerY()
 
-        // Treat buffer as swapped for portrait presentation of a 4:3 buffer.
-        val bufferRect = RectF(
-            0f, 0f,
-            previewSize.height.toFloat(),
-            previewSize.width.toFloat()
-        )
-        bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
-
-        matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
-
-        val scale = max(
-            viewWidth.toFloat() / previewSize.height.toFloat(),
-            viewHeight.toFloat() / previewSize.width.toFloat()
-        )
-        matrix.postScale(scale, scale, centerX, centerY)
+        if (rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270) {
+            // Landscape: swapped buffer rect, fill, uniform scale, rotate.
+            val bufferRect = RectF(
+                0f, 0f,
+                previewSize.height.toFloat(),
+                previewSize.width.toFloat()
+            )
+            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+            val scale = max(
+                viewHeight.toFloat() / previewSize.height.toFloat(),
+                viewWidth.toFloat() / previewSize.width.toFloat()
+            )
+            matrix.postScale(scale, scale, centerX, centerY)
+            matrix.postRotate(90f * (rotation - 2), centerX, centerY)
+        } else if (rotation == Surface.ROTATION_180) {
+            matrix.postRotate(180f, centerX, centerY)
+        } else {
+            // Portrait (old verified behavior): swapped buffer rect, fill,
+            // uniform scale — no rotation.
+            val bufferRect = RectF(
+                0f, 0f,
+                previewSize.height.toFloat(),
+                previewSize.width.toFloat()
+            )
+            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
+            val scale = max(
+                viewWidth.toFloat() / previewSize.height.toFloat(),
+                viewHeight.toFloat() / previewSize.width.toFloat()
+            )
+            matrix.postScale(scale, scale, centerX, centerY)
+        }
 
         binding.textureView.setTransform(matrix)
+    }
+
+    /**
+     * Size the preview view to the preview's aspect (0.76.6): the Camera2Basic
+     * transform recipe assumes the view's aspect matches the preview's —
+     * otherwise the fill step stretches. Landscape: the view is as tall as
+     * the screen and as wide as the preview's aspect allows, centered.
+     * Portrait: the view is as wide as the screen and as tall as the
+     * preview's aspect allows.
+     */
+    private fun applyPreviewAspectRatio() {
+        val cfg = previewConfig ?: return
+        val params =
+            binding.textureView.layoutParams as? ConstraintLayout.LayoutParams ?: return
+        val isLandscape =
+            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        params.dimensionRatio = if (isLandscape) {
+            "${cfg.previewSize.width}:${cfg.previewSize.height}"
+        } else {
+            "${cfg.previewSize.height}:${cfg.previewSize.width}"
+        }
+        binding.textureView.layoutParams = params
     }
 }

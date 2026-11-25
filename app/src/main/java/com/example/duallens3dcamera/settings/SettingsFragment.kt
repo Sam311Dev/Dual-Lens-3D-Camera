@@ -22,7 +22,10 @@ class SettingsFragment : PreferenceFragmentCompat() {
 
         setupPhotoPrefs()
         setupBitratePref()
+        setupVideoRecordModePref()
         setupVideoProcessingPrefs()
+        setupVideoColorMatchPref()
+        setupSbsViewPref()
         setupDebugPrefs(sp)
 
         val caps = AppSettings.loadStereoCaps(requireContext())
@@ -69,6 +72,16 @@ class SettingsFragment : PreferenceFragmentCompat() {
         bitrate.summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
     }
 
+    private fun setupVideoRecordModePref() {
+        val mode = findPreference<ListPreference>(AppSettings.KEY_VIDEO_RECORD_MODE) ?: return
+        mode.entries = arrayOf(
+            "Direct SBS — one finished video (waits ~1s to settle)",
+            "Two streams, stitched after"
+        )
+        mode.entryValues = arrayOf("direct", "stitched")
+        mode.summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
+    }
+
     private fun setupVideoProcessingPrefs() {
         val nr = findPreference<ListPreference>(AppSettings.KEY_VIDEO_NOISE_REDUCTION)
         val dc = findPreference<ListPreference>(AppSettings.KEY_VIDEO_DISTORTION_CORRECTION)
@@ -88,6 +101,28 @@ class SettingsFragment : PreferenceFragmentCompat() {
         edge?.entries = entriesOffFastHq
         edge?.entryValues = valuesOffFastHq
         edge?.summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
+    }
+
+    private fun setupVideoColorMatchPref() {
+        val match = findPreference<ListPreference>(AppSettings.KEY_VIDEO_COLOR_MATCH) ?: return
+        // "wide" is the warmer eye on the Moto G Stylus 2026; "ultra" is cooler.
+        match.entries = arrayOf(
+            "Warmer (match to wide)",
+            "Cooler (match to ultrawide)",
+            "Off (keep each lens's own colors)"
+        )
+        match.entryValues = arrayOf("wide", "ultra", "off")
+        match.summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
+    }
+
+    private fun setupSbsViewPref() {
+        val view = findPreference<ListPreference>(AppSettings.KEY_SBS_VIEW) ?: return
+        view.entries = arrayOf(
+            "Cross-eyed (right eye on the left)",
+            "Parallel (left eye on the left)"
+        )
+        view.entryValues = arrayOf("cross", "parallel")
+        view.summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
     }
 
     private fun setupDebugPrefs(sp: SharedPreferences) {

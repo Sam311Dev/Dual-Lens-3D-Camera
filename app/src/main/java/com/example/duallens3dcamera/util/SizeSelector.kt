@@ -75,6 +75,31 @@ object SizeSelector {
     }
 
     /**
+     * Largest common YUV 4:3 size capped at maxW x maxH.
+     * MOTO dual-device: the mandatory CONCURRENT stream combinations cap each camera
+     * at 1920x1440 while both cameras are open, so call with (1920, 1440) even though
+     * the non-concurrent lists go up to 4000x3000. Returns null if nothing fits.
+     */
+    fun chooseLargestCommonYuvFourByThreeCapped(
+        wideMap: StreamConfigurationMap,
+        ultraMap: StreamConfigurationMap,
+        maxW: Int,
+        maxH: Int
+    ): Size? {
+        val wideSizes = (wideMap.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()).toList()
+        val ultraSizes = (ultraMap.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()).toList()
+        if (wideSizes.isEmpty() || ultraSizes.isEmpty()) return null
+        val ultraSet = ultraSizes.map { it.width to it.height }.toSet()
+        val common = wideSizes.filter {
+            ultraSet.contains(it.width to it.height) && it.width <= maxW && it.height <= maxH
+        }
+        if (common.isEmpty()) return null
+        val fourByThree = common.filter { isFourByThree(it) }
+        val candidates = if (fourByThree.isNotEmpty()) fourByThree else common
+        return candidates.maxBy { it.width.toLong() * it.height.toLong() }
+    }
+
+    /**
      * Chooses the largest RAW_SENSOR size that is supported by BOTH cameras.
      * Returns null if either camera doesn't support RAW, or if there is no common size.
      */

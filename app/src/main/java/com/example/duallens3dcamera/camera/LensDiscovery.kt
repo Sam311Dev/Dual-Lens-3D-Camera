@@ -19,10 +19,24 @@ import kotlin.math.abs
  * We also bake in one intentionally-simple device heuristic:
  *  - Pixels: assume portrait use + wide is the RIGHT-eye image.
  *  - Non-Pixels (Samsung target): assume landscape use + wide is the LEFT-eye image.
+ *
+ * MOTO (dual-device) MODE:
+ *  Some Motorola phones (e.g. Moto G Stylus 2026, device "lamy") expose NO logical
+ *  multi-camera at all: cameraIdList is just "0" (wide) and "1" (front), and neither
+ *  camera reports LOGICAL_MULTI_CAMERA. The ultrawide exists as a HIDDEN camera ID
+ *  ("2", f=2.13mm) that is not in cameraIdList but CAN be opened directly — the
+ *  3DDualCam diagnostics prove ID 0 + ID 2 open together. In that case we return a
+ *  DUAL_DEVICE rig: wideId/ultraId are standalone camera IDs to open as two separate
+ *  CameraDevices, and logicalRearId is set to the wide ID (there is no logical camera).
+ *  The controller must NOT use OutputConfiguration.setPhysicalCameraId() in this mode.
  */
 object LensDiscovery {
 
     private const val TAG = "LensDiscovery"
+
+    /** How the two lenses are opened. LOGICAL = one logical camera, two physical streams
+     *  (Pixel/Samsung). DUAL_DEVICE = two standalone CameraDevices (Moto, no logical camera). */
+    enum class RigMode { LOGICAL, DUAL_DEVICE }
 
     data class StereoRig(
         val logicalRearId: String,
@@ -32,8 +46,14 @@ object LensDiscovery {
         /** Pixel or (assumed) Samsung */
         val phoneIsAPixel: Boolean,
         /** Pixel => portrait. Samsung => landscape. */
-        val assumedDisplayRotation: Int
-    )
+        val assumedDisplayRotation: Int,
+        val mode: RigMode = RigMode.LOGICAL,
+        /** Focal lengths (mm) of the wide / ultrawide, when known. */
+        val wideFocalMm: Float? = null,
+        val ultraFocalMm: Float? = null
+    ) {
+        val isDualDevice: Boolean get() = mode == RigMode.DUAL_DEVICE
+    }
 
     fun isPixelDevice(): Boolean {
         // Examples:
@@ -41,11 +61,39 @@ object LensDiscovery {
         return Build.MODEL?.contains("Pixel", ignoreCase = true) == true
     }
 
+    fun isMotoStylusDevice(): Boolean {
+        // Build.MODEL on the 2026 Stylus is "moto g stylus - 2026".
+        return Build.MODEL?.contains("moto g stylus", ignoreCase = true) == true
+    }
+
     /**
      * Discovers a usable rear stereo rig (ultrawide + wide) from Camera2 metadata.
-     * Returns null if we can't find a logical multi-camera exposing 2+ physical cameras.
+     * Returns null if we can't find a logical multi-camera exposing 2+ physical cameras
+     * AND we can't find a hidden dual-rear pair to open as two standalone devices.
+     *
+     * Order: on a Moto G Stylus we try the hidden dual-device scan first (it has no
+     * logical camera by design); everywhere else we try the logical path first and
+     * fall back to the hidden scan, so Pixel/Samsung behaviour is unchanged.
      */
     fun discoverStereoRig(cameraManager: CameraManager): StereoRig? {
+        if (isMotoStylusDevice()) {
+            scanHiddenRearRig(cameraManager)?.let {
+                Log.i(TAG, "Moto dual-device rig: wide=${it.wide1xId} ultra=${it.ultraId}")
+                return it
+            }
+            Log.w(TAG, "Moto Stylus: hidden dual-device scan failed, trying logical path")
+        }
+
+        discoverLogicalRig(cameraManager)?.let { return it }
+
+        // Fallback for any other phone whose OEM hides the ultrawide: if two rear
+        // cameras can be found by scanning IDs, open them as two standalone devices.
+        return scanHiddenRearRig(cameraManager)?.also {
+            Log.i(TAG, "Hidden dual-device rig (fallback): wide=${it.wide1xId} ultra=${it.ultraId}")
+        }
+    }
+
+    private fun discoverLogicalRig(cameraManager: CameraManager): StereoRig? {
         val isPixel = isPixelDevice()
 
         val logicalRearId = findBestLogicalRearCameraId(cameraManager) ?: run {
@@ -92,7 +140,71 @@ object LensDiscovery {
             ultraId = ultra.id,
             wide2xId = wide2x?.id,
             phoneIsAPixel = isPixel,
-            assumedDisplayRotation = if (isPixel) Surface.ROTATION_0 else Surface.ROTATION_90
+            assumedDisplayRotation = if (isPixel) Surface.ROTATION_0 else Surface.ROTATION_90,
+            mode = RigMode.LOGICAL,
+            wideFocalMm = wideFull.focalMm,
+            ultraFocalMm = ultra.focalMm
+        )
+    }
+
+    /**
+     * DUAL_DEVICE discovery for phones with no logical multi-camera (Moto G Stylus 2026).
+     *
+     * Scans camera IDs "0".."20" with getCameraCharacteristics() — IDs not in
+     * cameraIdList ("hidden" cameras) are still readable/openable on these phones, so
+     * a try/catch per ID is the discovery mechanism. Keeps back-facing cameras only
+     * and classifies by focal length exactly like the logical path: smallest focal
+     * group = ultrawide, next = wide.
+     *
+     * Verified on Moto G Stylus 2026 (lamy): ID 0 wide f=5.56mm, ID 2 ultrawide
+     * f=2.13mm (hidden), ID 1 front f=2.87mm (ignored: front-facing). ID 0 + ID 2
+     * were confirmed to open together. Do NOT gate on getConcurrentCameraIds() — it
+     * only lists front-camera combos (ID1, ID0+ID1) on this phone and omits 0+2.
+     */
+    fun scanHiddenRearRig(cameraManager: CameraManager): StereoRig? {
+        val infos = ArrayList<PhysicalInfo>()
+        for (n in 0..20) {
+            val id = n.toString()
+            val info = try {
+                val c = cameraManager.getCameraCharacteristics(id)
+                val facing = c.get(CameraCharacteristics.LENS_FACING)
+                if (facing != CameraCharacteristics.LENS_FACING_BACK) continue
+                readPhysicalInfo(cameraManager, id)
+            } catch (_: Exception) {
+                null
+            }
+            if (info != null) infos.add(info)
+        }
+        if (infos.size < 2) {
+            Log.e(TAG, "Hidden scan found <2 rear cameras: ${infos.map { it.id }}")
+            return null
+        }
+
+        val focalGroups = groupByApproxFocalMm(infos)
+        if (focalGroups.size < 2) {
+            Log.e(TAG, "Hidden scan: need at least 2 focal groups, found ${focalGroups.size}")
+            return null
+        }
+
+        val ultra = requireNotNull(focalGroups[0].maxByOrNull { it.areaMm2 })
+        val wideFull = requireNotNull(focalGroups[1].maxByOrNull { it.areaMm2 })
+
+        Log.i(TAG, "Hidden dual-device rig: wide=${wideFull.id} focal=${wideFull.focalMm}mm, " +
+            "ultra=${ultra.id} focal=${ultra.focalMm}mm")
+        // Lenses are stacked vertically on the back of these phones: landscape use,
+        // like Samsung. No 2x physical camera exists on the Moto.
+        // logicalRearId is set to the wide ID — there is no logical camera; the
+        // controller opens wideId and ultraId as two standalone CameraDevices.
+        return StereoRig(
+            logicalRearId = wideFull.id,
+            wide1xId = wideFull.id,
+            ultraId = ultra.id,
+            wide2xId = null,
+            phoneIsAPixel = false,
+            assumedDisplayRotation = Surface.ROTATION_90,
+            mode = RigMode.DUAL_DEVICE,
+            wideFocalMm = wideFull.focalMm,
+            ultraFocalMm = ultra.focalMm
         )
     }
 

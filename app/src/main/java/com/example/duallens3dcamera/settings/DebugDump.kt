@@ -117,10 +117,15 @@ object DebugDump {
             w.name("found").value(false)
         } else {
             w.name("found").value(true)
+            // "logical" (Pixel/Samsung: one logical camera, two physical streams) or
+            // "dual_device" (Moto: two standalone cameras, no logical camera).
+            w.name("mode").value(rig.mode.name.lowercase())
             w.name("logicalId").value(rig.logicalRearId)
             w.name("wide1xId").value(rig.wide1xId)
             w.name("wide2xId").value(rig.wide2xId)
             w.name("ultraId").value(rig.ultraId)
+            rig.wideFocalMm?.let { w.name("wideFocalMm").value(it.toDouble()) }
+            rig.ultraFocalMm?.let { w.name("ultraFocalMm").value(it.toDouble()) }
 
             // Add a small “high value” summary: common PRIVATE output sizes between wide+ultra
             try {

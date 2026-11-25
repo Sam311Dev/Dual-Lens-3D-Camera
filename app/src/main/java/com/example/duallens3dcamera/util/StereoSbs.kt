@@ -11,6 +11,7 @@ import org.opencv.core.DMatch
 import org.opencv.core.Mat
 import org.opencv.core.MatOfByte
 import org.opencv.core.MatOfDMatch
+import org.opencv.core.MatOfDouble
 import org.opencv.core.MatOfInt
 import org.opencv.core.MatOfKeyPoint
 import org.opencv.core.MatOfPoint2f
@@ -39,7 +40,30 @@ import kotlin.math.abs
 object StereoSbs {
     private const val TAG = "StereoSbs"
 
+    /**
+     * Which eye goes on which side of a side-by-side image/video.
+     * CROSS (the original layout): LEFT = ultrawide, RIGHT = wide — view
+     * cross-eyed. PARALLEL: LEFT = wide, RIGHT = ultrawide — view with eyes
+     * parallel (or in a viewer); better for video, which is harder to flip
+     * in post. Only the left/right placement changes; alignment and color
+     * matching are identical either way.
+     */
+    enum class SbsView {
+        CROSS, PARALLEL;
+
+        companion object {
+            fun fromSetting(value: String): SbsView =
+                if (value == "parallel") PARALLEL else CROSS
+        }
+    }
+
     @Volatile private var lastGoodAffine6: DoubleArray? = null
+    // The wide-frame size the cached affine was estimated for. An affine's
+    // translation is in pixels, so reusing a photo's affine (e.g. 1024x768)
+    // on video frames (e.g. 1920x1440) warps to the wrong place even though
+    // its scale still looks plausible — the cache is only valid for the size
+    // it was estimated at.
+    @Volatile private var lastGoodAffineSize: Pair<Int, Int>? = null
 
     // report alignments params or not
     private const val DEBUG_AFFINE_LOGS = true
@@ -47,6 +71,7 @@ object StereoSbs {
     // prevents the 1x affine from being reused right after a zoom-mode flip
     fun resetLastGoodAffine() {
         lastGoodAffine6 = null
+        lastGoodAffineSize = null
     }
 
     private fun logAffine(label: String, affine: Mat) {
@@ -60,13 +85,15 @@ object StereoSbs {
         Log.i(TAG, "Affine $label: scale=$scale thetaDeg=$thetaDeg tx=$tx ty=$ty")
     }
 
-    private fun storeLastGoodAffine(affine: Mat) {
+    private fun storeLastGoodAffine(affine: Mat, wideW: Int, wideH: Int) {
         val arr = DoubleArray(6)
         affine.get(0, 0, arr)
         lastGoodAffine6 = arr
+        lastGoodAffineSize = Pair(wideW, wideH)
     }
 
-    private fun loadLastGoodAffine(): Mat? {
+    private fun loadLastGoodAffine(wideW: Int, wideH: Int): Mat? {
+        if (lastGoodAffineSize != Pair(wideW, wideH)) return null
         val arr = lastGoodAffine6 ?: return null
         val m = Mat(2, 3, CvType.CV_64F)
         m.put(0, 0, *arr)
@@ -157,7 +184,13 @@ object StereoSbs {
     }
 
 
-    private fun ensureOpenCv(): Boolean {
+    /** Load the OpenCV native library once (idempotent). Every OpenCV
+     *  entry point must call this before allocating any Mat — a bare
+     *  `Mat(...)` with the library unloaded throws UnsatisfiedLinkError,
+     *  which is an Error, not an Exception, and kills the process.
+     *  (0.77.2: direct mode hit exactly that because its YUV->BGR step
+     *  allocated a Mat before anything had called this.) */
+    fun ensureOpenCv(): Boolean {
         if (openCvReady.get()) return true
         if (!triedInit.compareAndSet(false, true)) return openCvReady.get()
 
@@ -236,9 +269,74 @@ object StereoSbs {
         }
     }
 
-    fun alignAndCreateSbsJpegBytes(
-        wideRight: Nv21Frame,
-        ultraLeft: Nv21Frame,
+    /**
+     * One aligned frame pair: the wide eye untouched, the ultra eye warped into
+     * wide geometry, plus the 2x3 affine that maps ultra -> wide (kept so video
+     * stitching can reuse one estimated affine for every frame instead of
+     * re-running feature matching per frame). All three Mats are owned by the
+     * caller and must be released.
+     */
+    data class AlignedFrames(
+        val wideBgr: Mat,
+        val ultraAligned: Mat,
+        val affine: Mat
+    )
+
+    /**
+     * Align an already-decoded BGR pair (e.g. video frames). Takes ownership of
+     * both input Mats. Returns null when alignment could not be established.
+     * The returned affine is in full-resolution coordinates of the wide frame.
+     */
+    fun alignBgrPair(
+        wideBgrIn: Mat,
+        ultraBgrIn: Mat,
+        fallbackUltraOverlapFraction: Float = 0.66f
+    ): AlignedFrames? {
+        if (!ensureOpenCv()) {
+            try { wideBgrIn.release() } catch (_: Exception) {}
+            try { ultraBgrIn.release() } catch (_: Exception) {}
+            return null
+        }
+        return alignBgrMats(
+            wideBgrIn = wideBgrIn,
+            ultraBgrIn = ultraBgrIn,
+            zoom2xEnabled = false,
+            fallbackUltraOverlapFraction = fallbackUltraOverlapFraction
+        )
+    }
+
+    /**
+     * Warp an ultrawide BGR frame into wide geometry with a previously estimated
+     * affine (same interpolation rule as the photo path). The returned Mat is
+     * owned by the caller.
+     */
+    fun warpUltraWithAffine(ultraBgr: Mat, affine: Mat, wideW: Int, wideH: Int): Mat {
+        val m = DoubleArray(6)
+        affine.get(0, 0, m)
+        val scale = kotlin.math.hypot(m[0], m[3])
+        val interp = if (scale > 1.01) Imgproc.INTER_CUBIC else Imgproc.INTER_LINEAR
+        val out = Mat()
+        Imgproc.warpAffine(
+            ultraBgr,
+            out,
+            affine,
+            CvSize(wideW.toDouble(), wideH.toDouble()),
+            interp,
+            Core.BORDER_CONSTANT,
+            Scalar(0.0, 0.0, 0.0)
+        )
+        return out
+    }
+
+    /**
+     * Core alignment: feature-match the ultrawide onto the wide, warp it, and
+     * return both eyes plus the affine. Takes ownership of both input Mats
+     * (they are downscaled/released inside as needed). Shared by the photo
+     * SBS path (NV21 in) and the video stitcher (decoded BGR in).
+     */
+    private fun alignBgrMats(
+        wideBgrIn: Mat,
+        ultraBgrIn: Mat,
         zoom2xEnabled: Boolean = false,
         ultraInnerFractionForFeatures: Float = 0.80f,
         fallbackUltraOverlapFraction: Float = 0.66f,
@@ -247,11 +345,9 @@ object StereoSbs {
         orbMaxFeatures: Int = 2000,
         ransacReprojThreshold: Double = 3.0,
         minInliers: Int = 35
-    ): ByteArray? {
-        if (!ensureOpenCv()) return null
-
-        var wideBgr: Mat? = null
-        var ultraBgr: Mat? = null
+    ): AlignedFrames? {
+        var wideBgr: Mat? = wideBgrIn
+        var ultraBgr: Mat? = ultraBgrIn
         var wideGray: Mat? = null
         var ultraGray: Mat? = null
         var wideSmall: Mat? = null
@@ -259,16 +355,7 @@ object StereoSbs {
         var affineSmall: Mat? = null
         var affineFull: Mat? = null
         var ultraAligned: Mat? = null
-        var sbs: Mat? = null
-
         try {
-            wideBgr = nv21ToBgrMat(wideRight.nv21, wideRight.width, wideRight.height) ?: return null
-            ultraBgr = nv21ToBgrMat(ultraLeft.nv21, ultraLeft.width, ultraLeft.height) ?: return null
-
-            // Rotate to match what JPEG_ORIENTATION used to do.
-            wideBgr = rotateBgr(requireNotNull(wideBgr), wideRight.rotationDegrees)
-            ultraBgr = rotateBgr(requireNotNull(ultraBgr), ultraLeft.rotationDegrees)
-
             // Safety downscale to prevent pathological memory usage.
             wideBgr = downscaleIfNeeded(requireNotNull(wideBgr), maxOutputDim)
             ultraBgr = downscaleIfNeeded(requireNotNull(ultraBgr), maxOutputDim)
@@ -385,9 +472,10 @@ object StereoSbs {
                 }
             }
 
-            // Fallback chain: last good affine -> centered scale heuristic
+            // Fallback chain: last good affine (same frame size only) ->
+            // centered scale heuristic
             if (affineFull == null) {
-                val last = loadLastGoodAffine()
+                val last = loadLastGoodAffine(wideW, wideH)
                 if (last != null && isAffinePlausible(last, ultraW, ultraH, wideW, wideH, expectedScale)) {
                     Log.w(TAG, "Using cached lastGoodAffine fallback")
                     affineFull = last
@@ -403,8 +491,8 @@ object StereoSbs {
                     )
                 }
             } else {
-                // Cache the full-res affine for next time.
-                storeLastGoodAffine(requireNotNull(affineFull))
+                // Cache the full-res affine for next time (same size only).
+                storeLastGoodAffine(requireNotNull(affineFull), wideW, wideH)
             }
 
             if (DEBUG_AFFINE_LOGS) {
@@ -412,33 +500,25 @@ object StereoSbs {
             }
 
             // Warp ultrawide into wide geometry.
-            ultraAligned = Mat()
-
-            // If the affine scale is >1 (and it usually is when matching UW → W FOV),
-            // use INTER_CUBIC to prevent softening fine detail / edges
-            val m = DoubleArray(6)
-            affineFull.get(0, 0, m)
-            val scale = kotlin.math.hypot(m[0], m[3]) // approx uniform scale
-            val interp = if (scale > 1.01) Imgproc.INTER_CUBIC else Imgproc.INTER_LINEAR
-
-            Imgproc.warpAffine(
+            ultraAligned = warpUltraWithAffine(
                 requireNotNull(ultraBgr),
-                ultraAligned,
                 requireNotNull(affineFull),
-                CvSize(wideW.toDouble(), wideH.toDouble()),
-                interp,
-                Core.BORDER_CONSTANT,
-                Scalar(0.0, 0.0, 0.0)
+                wideW,
+                wideH
             )
 
-            // Assemble SBS: LEFT = aligned ultra, RIGHT = wide
-            sbs = Mat(wideH, wideW * 2, CvType.CV_8UC3)
-            requireNotNull(ultraAligned).copyTo(requireNotNull(sbs).submat(0, wideH, 0, wideW))
-            requireNotNull(wideBgr).copyTo(requireNotNull(sbs).submat(0, wideH, wideW, wideW * 2))
-
-            return encodeJpegBytes(requireNotNull(sbs), 100)
+            val result = AlignedFrames(
+                wideBgr = requireNotNull(wideBgr),
+                ultraAligned = requireNotNull(ultraAligned),
+                affine = requireNotNull(affineFull)
+            )
+            // Hand ownership to the caller: null the locals so finally doesn't release them.
+            wideBgr = null
+            ultraAligned = null
+            affineFull = null
+            return result
         } catch (e: Exception) {
-            Log.e(TAG, "alignAndCreateSbsJpegBytes(YUV) failed: ${e.message}", e)
+            Log.e(TAG, "alignBgrMats failed: ${e.message}", e)
             return null
         } finally {
             try { affineSmall?.release() } catch (_: Exception) {}
@@ -448,9 +528,260 @@ object StereoSbs {
             try { wideSmall?.release() } catch (_: Exception) {}
             try { ultraSmall?.release() } catch (_: Exception) {}
             try { ultraAligned?.release() } catch (_: Exception) {}
-            try { sbs?.release() } catch (_: Exception) {}
             try { wideBgr?.release() } catch (_: Exception) {}
             try { ultraBgr?.release() } catch (_: Exception) {}
+        }
+    }
+
+    fun alignAndCreateSbsJpegBytes(
+        wideFrame: Nv21Frame,
+        ultraFrame: Nv21Frame,
+        zoom2xEnabled: Boolean = false,
+        ultraInnerFractionForFeatures: Float = 0.80f,
+        fallbackUltraOverlapFraction: Float = 0.66f,
+        maxOutputDim: Int = 6144,
+        featureMaxDim: Int = 1600,
+        orbMaxFeatures: Int = 2000,
+        ransacReprojThreshold: Double = 3.0,
+        minInliers: Int = 35,
+        sbsView: SbsView = SbsView.CROSS
+    ): ByteArray? {
+        if (!ensureOpenCv()) return null
+
+        var wideBgr: Mat? = null
+        var ultraBgr: Mat? = null
+        try {
+            wideBgr = nv21ToBgrMat(wideFrame.nv21, wideFrame.width, wideFrame.height) ?: return null
+            ultraBgr = nv21ToBgrMat(ultraFrame.nv21, ultraFrame.width, ultraFrame.height) ?: return null
+
+            // Rotate to match what JPEG_ORIENTATION used to do.
+            wideBgr = rotateBgr(requireNotNull(wideBgr), wideFrame.rotationDegrees)
+            ultraBgr = rotateBgr(requireNotNull(ultraBgr), ultraFrame.rotationDegrees)
+
+            // alignBgrMats takes ownership of both inputs: hand them over and
+            // null the locals first so this finally can't double-release them.
+            val wideIn = requireNotNull(wideBgr)
+            val ultraIn = requireNotNull(ultraBgr)
+            wideBgr = null
+            ultraBgr = null
+            val aligned = alignBgrMats(
+                wideBgrIn = wideIn,
+                ultraBgrIn = ultraIn,
+                zoom2xEnabled = zoom2xEnabled,
+                ultraInnerFractionForFeatures = ultraInnerFractionForFeatures,
+                fallbackUltraOverlapFraction = fallbackUltraOverlapFraction,
+                maxOutputDim = maxOutputDim,
+                featureMaxDim = featureMaxDim,
+                orbMaxFeatures = orbMaxFeatures,
+                ransacReprojThreshold = ransacReprojThreshold,
+                minInliers = minInliers
+            ) ?: return null
+
+            // Assemble SBS: CROSS -> LEFT = aligned ultra, RIGHT = wide;
+            // PARALLEL -> LEFT = wide, RIGHT = aligned ultra.
+            val sbs = if (sbsView == SbsView.PARALLEL) {
+                assembleSbsMat(aligned.wideBgr, aligned.ultraAligned)
+            } else {
+                assembleSbsMat(aligned.ultraAligned, aligned.wideBgr)
+            }
+            if (sbs == null) {
+                try { aligned.wideBgr.release() } catch (_: Exception) {}
+                try { aligned.ultraAligned.release() } catch (_: Exception) {}
+                try { aligned.affine.release() } catch (_: Exception) {}
+                return null
+            }
+            try {
+                return encodeJpegBytes(sbs, 100)
+            } finally {
+                try { sbs.release() } catch (_: Exception) {}
+                try { aligned.wideBgr.release() } catch (_: Exception) {}
+                try { aligned.ultraAligned.release() } catch (_: Exception) {}
+                try { aligned.affine.release() } catch (_: Exception) {}
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "alignAndCreateSbsJpegBytes(YUV) failed: ${e.message}", e)
+            return null
+        } finally {
+            try { wideBgr?.release() } catch (_: Exception) {}
+            try { ultraBgr?.release() } catch (_: Exception) {}
+        }
+    }
+
+    /** Assemble an SBS Mat: LEFT = [left], RIGHT = [right]. Returned Mat is owned by the caller. */
+    fun assembleSbsMat(left: Mat, right: Mat): Mat? {
+        val h = left.rows()
+        val w = left.cols()
+        if (right.rows() != h || right.cols() != w) return null
+        val sbs = Mat(h, w * 2, CvType.CV_8UC3)
+        left.copyTo(sbs.submat(0, h, 0, w))
+        right.copyTo(sbs.submat(0, h, w, w * 2))
+        return sbs
+    }
+
+    /**
+     * Per-channel color-transfer parameters (BGR order): out = in * alpha + beta.
+     * Computed once (e.g. from the first frame pair of a video) and applied to
+     * every frame so the match can't flicker.
+     */
+    data class ColorMatchParams(val alpha: DoubleArray, val beta: DoubleArray)
+
+    /** Per-channel mean/std color transfer from [src] onto [ref]'s statistics,
+     *  computed under [mask]. Scale is clamped to [0.25, 4.0]; near-flat source
+     *  channels are shifted, not scaled. */
+    fun computeColorMatchParams(src: Mat, ref: Mat, mask: Mat): ColorMatchParams {
+        val srcMean = MatOfDouble()
+        val srcStd = MatOfDouble()
+        val refMean = MatOfDouble()
+        val refStd = MatOfDouble()
+        try {
+            Core.meanStdDev(src, srcMean, srcStd, mask)
+            Core.meanStdDev(ref, refMean, refStd, mask)
+            val srcMeanArr = srcMean.toArray()
+            val srcStdArr = srcStd.toArray()
+            val refMeanArr = refMean.toArray()
+            val refStdArr = refStd.toArray()
+            val alpha = DoubleArray(3)
+            val beta = DoubleArray(3)
+            for (i in 0..2) {
+                val mS = srcMeanArr[i]
+                val sS = srcStdArr[i]
+                val mR = refMeanArr[i]
+                val sR = refStdArr[i]
+                alpha[i] = if (sS > 1e-3) (sR / sS).coerceIn(0.25, 4.0) else 1.0
+                beta[i] = mR - alpha[i] * mS
+            }
+            return ColorMatchParams(alpha, beta)
+        } finally {
+            try { srcMean.release() } catch (_: Exception) {}
+            try { srcStd.release() } catch (_: Exception) {}
+            try { refMean.release() } catch (_: Exception) {}
+            try { refStd.release() } catch (_: Exception) {}
+        }
+    }
+
+    /** Apply precomputed [ColorMatchParams] to [src]. Returned Mat is owned by the caller. */
+    fun applyColorMatchParams(src: Mat, params: ColorMatchParams): Mat {
+        val srcChannels = ArrayList<Mat>()
+        Core.split(src, srcChannels)
+        val outChannels = ArrayList<Mat>(3)
+        for (i in 0..2) {
+            val ch = Mat()
+            srcChannels[i].convertTo(ch, CvType.CV_8U, params.alpha[i], params.beta[i])
+            outChannels.add(ch)
+        }
+        val out = Mat()
+        Core.merge(outChannels, out)
+        srcChannels.forEach { try { it.release() } catch (_: Exception) {} }
+        outChannels.forEach { try { it.release() } catch (_: Exception) {} }
+        return out
+    }
+
+    /**
+     * Color-matched SBS variants, built from an already-aligned SBS JPEG.
+     * [sbsView] must match the layout the SBS was assembled with (CROSS:
+     * LEFT = aligned ultra, RIGHT = wide; PARALLEL: the other way round) so
+     * the halves are identified correctly and the variants keep the same
+     * layout. The two lenses run independent AWB/AE, so the eyes can differ
+     * a lot in white balance and brightness — on the Moto G Stylus 2026 the
+     * wide is noticeably warmer and darker than the ultrawide. Each variant
+     * color-transfers one eye onto the other's statistics (per-channel
+     * mean/std matching, Reinhard-style), computed over the overlap region
+     * only: the warped ultra's black borders are masked out of the
+     * statistics so they don't drag the match down. The alignment is
+     * identical to the plain SBS; only the colors change.
+     *
+     * Returns (matchedToWide, matchedToUltra):
+     *  - matchedToWide: ultra eye adjusted to the wide eye's colors; wide untouched.
+     *  - matchedToUltra: wide eye adjusted to the ultra eye's colors; ultra untouched.
+     * Either entry is null if that variant could not be built.
+     */
+    fun createColorMatchedSbsVariants(
+        sbsJpegBytes: ByteArray,
+        sbsView: SbsView = SbsView.CROSS
+    ): Pair<ByteArray?, ByteArray?> {
+        if (!ensureOpenCv()) return Pair(null, null)
+
+        var sbs: Mat? = null
+        try {
+            val buf = MatOfByte(*sbsJpegBytes)
+            sbs = Imgcodecs.imdecode(buf, Imgcodecs.IMREAD_COLOR)
+            buf.release()
+            val sbsMat = sbs ?: return Pair(null, null)
+            if (sbsMat.empty()) return Pair(null, null)
+            val w = sbsMat.cols()
+            val h = sbsMat.rows()
+            if (w < 4 || w % 2 != 0 || h < 1) return Pair(null, null)
+            val halfW = w / 2
+
+            val leftHalf = sbsMat.submat(0, h, 0, halfW)
+            val rightHalf = sbsMat.submat(0, h, halfW, w)
+            // Identify the eyes by the layout the SBS was assembled with.
+            val ultra = if (sbsView == SbsView.PARALLEL) rightHalf else leftHalf
+            val wide = if (sbsView == SbsView.PARALLEL) leftHalf else rightHalf
+
+            var mask = validityMask(ultra)
+            if (Core.countNonZero(mask) < (halfW * h * 0.01)) {
+                // Almost no valid overlap (e.g. a failed warp): fall back to the
+                // whole frame so the stats are at least defined.
+                try { mask.release() } catch (_: Exception) {}
+                mask = Mat(h, halfW, CvType.CV_8UC1, Scalar(255.0))
+            }
+
+            val ultraToWide = matchColors(ultra, wide, mask)
+            val wideToUltra = matchColors(wide, ultra, mask)
+            try { mask.release() } catch (_: Exception) {}
+
+            val matchedToWide = assembleEyesAndEncode(ultraToWide, wide, sbsView)
+            val matchedToUltra = assembleEyesAndEncode(ultra, wideToUltra, sbsView)
+
+            try { ultraToWide.release() } catch (_: Exception) {}
+            try { wideToUltra.release() } catch (_: Exception) {}
+
+            return Pair(matchedToWide, matchedToUltra)
+        } catch (e: Exception) {
+            Log.e(TAG, "createColorMatchedSbsVariants failed: ${e.message}", e)
+            return Pair(null, null)
+        } finally {
+            try { sbs?.release() } catch (_: Exception) {}
+        }
+    }
+
+    /** Assemble the two eyes into an SBS JPEG in [sbsView] layout. */
+    private fun assembleEyesAndEncode(ultraEye: Mat, wideEye: Mat, sbsView: SbsView): ByteArray? =
+        if (sbsView == SbsView.PARALLEL) {
+            assembleAndEncode(wideEye, ultraEye)
+        } else {
+            assembleAndEncode(ultraEye, wideEye)
+        }
+
+    /** Mask of the warped ultra's valid (non-black-border) pixels: 255 where the
+     *  pixel is not near-black, 0 where it is. */
+    fun validityMask(ultraAligned: Mat): Mat {
+        val gray = Mat()
+        val mask = Mat()
+        try {
+            Imgproc.cvtColor(ultraAligned, gray, Imgproc.COLOR_BGR2GRAY)
+            Imgproc.threshold(gray, mask, 8.0, 255.0, Imgproc.THRESH_BINARY)
+            return mask
+        } finally {
+            try { gray.release() } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Per-channel mean/std color transfer: returns a new Mat with [src]'s colors
+     * shifted to match [ref]'s, statistics computed under [mask] (same size as
+     * src/ref). Delegates to [computeColorMatchParams] + [applyColorMatchParams].
+     */
+    private fun matchColors(src: Mat, ref: Mat, mask: Mat): Mat =
+        applyColorMatchParams(src, computeColorMatchParams(src, ref, mask))
+
+    private fun assembleAndEncode(left: Mat, right: Mat): ByteArray? {
+        val sbs = assembleSbsMat(left, right) ?: return null
+        try {
+            return encodeJpegBytes(sbs, 100)
+        } finally {
+            try { sbs.release() } catch (_: Exception) {}
         }
     }
 
