@@ -71,12 +71,12 @@
             app:cornerRadius="0dp"/>
     </LinearLayout>
 
-    <!-- Preview (TextureView must NOT have android:background) -->
-    <TextureView
-        android:id="@+id/textureView"
+    <!-- Preview (GL SBS view; both lenses, composited on the GPU) -->
+    <com.example.duallens3dcamera.preview.SbsPreviewView
+        android:id="@+id/sbsPreview"
         android:layout_width="0dp"
         android:layout_height="0dp"
-        app:layout_constraintDimensionRatio="3:4"
+        app:layout_constraintDimensionRatio="8:3"
         app:layout_constraintTop_toBottomOf="@id/topBar"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"/>
@@ -99,8 +99,8 @@
         android:textSize="13sp"
         android:textStyle="bold"
         android:visibility="gone"
-        app:layout_constraintTop_toTopOf="@id/textureView"
-        app:layout_constraintEnd_toEndOf="@id/textureView"/>
+        app:layout_constraintTop_toTopOf="@id/sbsPreview"
+        app:layout_constraintEnd_toEndOf="@id/sbsPreview"/>
 
     <!-- 1x/2x zoom toggle (overlayed on preview) -->
     <com.google.android.material.button.MaterialButton
@@ -125,8 +125,8 @@
         android:textColor="@android:color/white"
         app:backgroundTint="@color/control_dark"
         app:cornerRadius="16dp"
-        app:layout_constraintBottom_toBottomOf="@id/textureView"
-        app:layout_constraintEnd_toEndOf="@id/textureView"/>
+        app:layout_constraintBottom_toBottomOf="@id/sbsPreview"
+        app:layout_constraintEnd_toEndOf="@id/sbsPreview"/>
 
     <!-- SBS stitch progress (0.76.5): shows while the video is converting -->
     <LinearLayout
@@ -143,9 +143,9 @@
         android:paddingTop="8dp"
         android:paddingBottom="8dp"
         android:visibility="gone"
-        app:layout_constraintBottom_toBottomOf="@id/textureView"
-        app:layout_constraintStart_toStartOf="@id/textureView"
-        app:layout_constraintEnd_toEndOf="@id/textureView">
+        app:layout_constraintBottom_toBottomOf="@id/sbsPreview"
+        app:layout_constraintStart_toStartOf="@id/sbsPreview"
+        app:layout_constraintEnd_toEndOf="@id/sbsPreview">
 
         <ProgressBar
             android:id="@+id/stitchProgressBar"
@@ -173,7 +173,7 @@
         android:layout_width="0dp"
         android:layout_height="0dp"
         android:orientation="vertical"
-        app:layout_constraintTop_toBottomOf="@id/textureView"
+        app:layout_constraintTop_toBottomOf="@id/sbsPreview"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">

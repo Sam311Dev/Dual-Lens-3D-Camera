@@ -6,15 +6,13 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
-import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.RectF
 import android.hardware.camera2.CaptureRequest
 import android.os.Bundle
 import android.os.Looper
+import android.util.Log
 import android.util.Size
 import android.view.Surface
-import android.view.TextureView
 import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -22,6 +20,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.content.ContextCompat
 import com.example.duallens3dcamera.camera.LensDiscovery
+import com.example.duallens3dcamera.preview.SbsPreviewView
 import com.example.duallens3dcamera.settings.AppSettings
 import com.example.duallens3dcamera.settings.SettingsActivity
 import com.example.duallens3dcamera.camera.StereoCameraController
@@ -30,7 +29,6 @@ import com.example.duallens3dcamera.databinding.ActivityMainBinding
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import kotlin.math.max
 
 class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
 
@@ -70,11 +68,30 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
 
     private var previewConfig: StereoCameraController.PreviewConfig? = null
 
-    // for ensuring the preview always has the right aspect
-    @Volatile private var reapplyTransformOnNextFrame = false
-    private fun requestPreviewTransformReapply() {
-        reapplyTransformOnNextFrame = true
-    }
+    // 0.79.6: the texture pair the camera was started with. The GL
+    // surface is recreated on every resume (EGL context not
+    // preserved), so the view hands us a fresh pair — if the camera
+    // was started with the old pair, it writes into textures nobody
+    // draws and the preview stays black (the Settings-return bug).
+    private var startedWideTexture: android.graphics.SurfaceTexture? = null
+    private var startedUltraTexture: android.graphics.SurfaceTexture? = null
+
+    // 0.79.5: how many times this foregrounding has already auto-restarted
+    // the camera after the controller spent its preview retries. Bounded
+    // (2) so a genuinely broken camera can't loop forever.
+    private var previewAutoRestarts: Int = 0
+
+    // GPU SBS preview (0.78.0): whether the setting wants SBS, whether the
+    // current camera session is actually running it, and which eye is left.
+    // The cross/parallel flip is GL-side, so it applies live with no restart.
+    private var sbsPreviewEnabled: Boolean = true
+    // 0.79.7: frame pairing (Settings > Preview > "Pair frames").
+    private var pairFramesEnabled: Boolean = true
+    // 0.79.9: color-match mode (Settings > Video > "SBS video color
+    // match"): "wide" / "ultra" / "off".
+    private var colorMatchMode: String = "wide"
+    private var sbsPreviewActive: Boolean = false
+    private var sbsViewCross: Boolean = true
 
     // 0.76.5: whether the currently inflated layout is the landscape one.
     // Set at inflation time in onCreate; onConfigurationChanged compares it
@@ -160,7 +177,6 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
             savePrefs()
             updateFormatButton()
             controller.setPhotoOutputRaw(rawMode)
-            requestPreviewTransformReapply() // make sure preview still has the right aspect
         }
 
         binding.btnTorch.setOnClickListener {
@@ -176,7 +192,6 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
             updateUi()
             val ts = timestampForFilename()
             controller.captureStereoPhoto(ts, rawMode)
-            requestPreviewTransformReapply() // make sure preview still has the right aspect
         }
 
         binding.btnZoom.setOnClickListener {
@@ -185,7 +200,6 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
             savePrefs()
             updateZoomButton()
             controller.setZoom2x(zoom2xEnabled)
-            requestPreviewTransformReapply() // keep preview aspect sane
         }
 
         binding.btnRecord.setOnClickListener {
@@ -208,31 +222,38 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
             }
         }
 
-        binding.textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-            override fun onSurfaceTextureAvailable(surface: android.graphics.SurfaceTexture, width: Int, height: Int) {
-                maybeStartCamera()
-                configureTransform(width, height)
-            }
-
-            override fun onSurfaceTextureSizeChanged(surface: android.graphics.SurfaceTexture, width: Int, height: Int) {
-                configureTransform(width, height)
-            }
-
-            override fun onSurfaceTextureDestroyed(surface: android.graphics.SurfaceTexture): Boolean {
-                controller.stop()
-                previewConfig = null
-                return true
-            }
-
-//            override fun onSurfaceTextureUpdated(surface: android.graphics.SurfaceTexture) = Unit
-            override fun onSurfaceTextureUpdated(surface: android.graphics.SurfaceTexture) {
-                if (reapplyTransformOnNextFrame) {
-                    reapplyTransformOnNextFrame = false
-                    configureTransform(binding.textureView.width, binding.textureView.height)
+        // 0.78.0: the GPU SBS preview owns both preview textures. They are
+        // created on the GL thread when the surface is created (and again
+        // after a pause, since the EGL context is not preserved), and the
+        // camera starts once they exist.
+        binding.sbsPreview.listener = object : SbsPreviewView.Listener {
+            override fun onPreviewTexturesReady(
+                wide: android.graphics.SurfaceTexture,
+                ultra: android.graphics.SurfaceTexture
+            ) {
+                // 0.79.6: if the camera is already running but with a
+                // different texture pair (the GL surface was recreated
+                // on resume while the camera was started with the old
+                // pair — the Settings-return black screen), restart it
+                // with the new pair. Otherwise the camera writes into
+                // textures nobody draws and the preview stays black.
+                if (previewConfig != null &&
+                    (wide !== startedWideTexture || ultra !== startedUltraTexture)
+                ) {
+                    Log.i("MainActivity", "Preview textures recreated — restarting camera with the new pair")
+                    controller.stop()
+                    previewConfig = null
+                    sbsPreviewActive = false
+                    startedWideTexture = null
+                    startedUltraTexture = null
                 }
+                maybeStartCamera()
             }
-
         }
+        binding.sbsPreview.setSbsMode(sbsPreviewEnabled, sbsViewCross)
+        binding.sbsPreview.pairFrames = pairFramesEnabled
+        binding.sbsPreview.applyColorMatchMode(colorMatchMode)
+        binding.sbsPreview.setDisplayRotation(display?.rotation ?: Surface.ROTATION_0)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -250,39 +271,66 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
             return
         }
         controller.setDisplayRotation(display?.rotation ?: Surface.ROTATION_0)
-        binding.textureView.post {
-            configureTransform(binding.textureView.width, binding.textureView.height)
-        }
+        // 0.78.1: the GL shader rotates the sampling coordinates itself
+        // (the ST matrix does not), so a 180° landscape flip is a live
+        // GL-side change — no camera restart, no transform to re-fit.
+        binding.sbsPreview.setDisplayRotation(display?.rotation ?: Surface.ROTATION_0)
+        applyPreviewAspectRatio()
     }
 
     override fun onResume() {
         super.onResume()
+        // Resume the GL thread first: if the surface was recreated, the
+        // textures listener fires and starts the camera from there.
+        binding.sbsPreview.onResume()
         if (!hasAllPermissions()) {
             requestPermissions()
         } else {
             AppSettings.ensureCameraBasedDefaults(this)
+            // If the SBS setting changed while we were in Settings, restart
+            // the camera so the new preview mode takes effect. A cross /
+            // parallel flip needs no restart (GL-side only).
+            val wasSbsActive = sbsPreviewActive
             loadPrefs()
+            binding.sbsPreview.setSbsMode(sbsPreviewEnabled, sbsViewCross)
+            binding.sbsPreview.pairFrames = pairFramesEnabled
+            binding.sbsPreview.applyColorMatchMode(colorMatchMode)
+            binding.sbsPreview.setDisplayRotation(display?.rotation ?: Surface.ROTATION_0)
             updateTopBarUi()
             updateZoomButton()
             updateTorchButton()
             updateUi()
+            if (previewConfig != null && sbsPreviewEnabled != wasSbsActive) {
+                controller.stop()
+                previewConfig = null
+                sbsPreviewActive = false
+            }
+            previewAutoRestarts = 0
             maybeStartCamera()
         }
     }
 
 
     override fun onPause() {
+        // Stop the camera BEFORE pausing the GL thread, so no session is
+        // still writing into a texture whose EGL context is going away.
         controller.stop()
         previewConfig = null
+        sbsPreviewActive = false
+        startedWideTexture = null
+        startedUltraTexture = null
+        binding.sbsPreview.onPause()
         super.onPause()
     }
 
     private fun maybeStartCamera() {
         if (!hasAllPermissions()) return
-        if (!binding.textureView.isAvailable) return
         if (previewConfig != null) return
-
-        val st = binding.textureView.surfaceTexture ?: return
+        // The GL textures may not exist yet on a cold start; the listener
+        // calls us again once onSurfaceCreated has made them.
+        val (wideSt, ultraSt) = binding.sbsPreview.surfaceTextures() ?: return
+        startedWideTexture = wideSt
+        startedUltraTexture = ultraSt
         val rotation = display?.rotation ?: Surface.ROTATION_0
 
 //        previewConfig = controller.start(
@@ -298,7 +346,9 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
 
         previewConfig = controller.start(
             StereoCameraController.StartParams(
-                surfaceTexture = st,
+                surfaceTexture = wideSt,
+                ultraSurfaceTexture = ultraSt,
+                sbsPreviewEnabled = sbsPreviewEnabled,
                 displayRotation = rotation,
                 rawMode = rawMode,
                 torchOn = torchOn,
@@ -322,12 +372,10 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
             )
         )
 
-        binding.textureView.post {
-            // 0.76.6: size the preview to the preview's aspect first, then fit
-            // the transform to the resulting view size.
-            applyPreviewAspectRatio()
-            configureTransform(binding.textureView.width, binding.textureView.height)
-        }
+        // Optimistic until the controller says otherwise: if the ultra
+        // preview stream is refused, onSbsPreviewFallback switches us back.
+        sbsPreviewActive = sbsPreviewEnabled
+        binding.sbsPreview.post { applyPreviewAspectRatio() }
     }
 
     private fun hasAllPermissions(): Boolean {
@@ -434,6 +482,10 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
 
         previewResolution = AppSettings.getPreviewResolution(this)
         previewFps = AppSettings.getPreviewFps(this)
+        sbsPreviewEnabled = AppSettings.isSbsPreviewEnabled(this)
+        pairFramesEnabled = AppSettings.isPairFramesEnabled(this)
+        colorMatchMode = AppSettings.getVideoColorMatch(this)
+        sbsViewCross = !AppSettings.isSbsParallel(this)
 
         photoNoiseReductionMode = AppSettings.getPhotoNoiseReductionMode(this)
         photoDistortionCorrectionMode = AppSettings.getPhotoDistortionCorrectionMode(this)
@@ -598,7 +650,6 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
         binding.stitchProgressCard.visibility = View.GONE
         binding.stitchProgressBar.isIndeterminate = false
         updateUi()
-        requestPreviewTransformReapply() // make sure preview still has the right aspect
     }
 
     // 0.77.0: direct SBS mode — the lenses are settling before encoding
@@ -647,85 +698,72 @@ class MainActivity : AppCompatActivity(), StereoCameraController.Callback {
         )
     }
 
-    // ---------------- Preview transform ----------------
-    // 0.76.6: the Camera2Basic sample recipe, verbatim. 0.76.5 got this
-    // wrong — it mapped the buffer straight onto the landscape view with no
-    // rotation, so the preview came out sideways and stretched. The texture
-    // is portrait-effective (the camera presents it upright for the phone's
-    // natural portrait orientation, and TextureView does not rotate it for
-    // you), so a landscape view needs the sample's 90° rotation. The
-    // landscape view is aspect-matched to the preview (see
-    // applyPreviewAspectRatio), which is what keeps the fill step from
-    // distorting — the sample assumes the same. Portrait keeps the old
-    // behavior, which was verified correct.
-    private fun configureTransform(viewWidth: Int, viewHeight: Int) {
-        val cfg = previewConfig ?: return
-        if (viewWidth <= 0 || viewHeight <= 0) return
-
-        val previewSize = cfg.previewSize
-        val rotation = display?.rotation ?: Surface.ROTATION_0
-
-        val matrix = Matrix()
-        val viewRect = RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat())
-        val centerX = viewRect.centerX()
-        val centerY = viewRect.centerY()
-
-        if (rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270) {
-            // Landscape: swapped buffer rect, fill, uniform scale, rotate.
-            val bufferRect = RectF(
-                0f, 0f,
-                previewSize.height.toFloat(),
-                previewSize.width.toFloat()
-            )
-            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
-            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
-            val scale = max(
-                viewHeight.toFloat() / previewSize.height.toFloat(),
-                viewWidth.toFloat() / previewSize.width.toFloat()
-            )
-            matrix.postScale(scale, scale, centerX, centerY)
-            matrix.postRotate(90f * (rotation - 2), centerX, centerY)
-        } else if (rotation == Surface.ROTATION_180) {
-            matrix.postRotate(180f, centerX, centerY)
-        } else {
-            // Portrait (old verified behavior): swapped buffer rect, fill,
-            // uniform scale — no rotation.
-            val bufferRect = RectF(
-                0f, 0f,
-                previewSize.height.toFloat(),
-                previewSize.width.toFloat()
-            )
-            bufferRect.offset(centerX - bufferRect.centerX(), centerY - bufferRect.centerY())
-            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL)
-            val scale = max(
-                viewWidth.toFloat() / previewSize.height.toFloat(),
-                viewHeight.toFloat() / previewSize.width.toFloat()
-            )
-            matrix.postScale(scale, scale, centerX, centerY)
-        }
-
-        binding.textureView.setTransform(matrix)
+    // 0.78.2: live preview color match — the controller worked out the
+    // ultra eye's gain from the lenses' own AWB + exposure; hand it to
+    // the GL view (wide eye stays the un-gained reference).
+    override fun onPreviewColorGains(r: Float, g: Float, b: Float) = onUi {
+        binding.sbsPreview.setUltraColorGain(r, g, b)
     }
 
-    /**
-     * Size the preview view to the preview's aspect (0.76.6): the Camera2Basic
-     * transform recipe assumes the view's aspect matches the preview's —
-     * otherwise the fill step stretches. Landscape: the view is as tall as
-     * the screen and as wide as the preview's aspect allows, centered.
-     * Portrait: the view is as wide as the screen and as tall as the
-     * preview's aspect allows.
-     */
+    // 0.79.1: GPU SBS video — hand the recorder the preview view's
+    // shared EGL context, frame signal and latest render state, so it
+    // can render the same SBS frame into the encoder on its own thread.
+    override fun gpuRecordSource(): com.example.duallens3dcamera.preview.SbsPreviewView.GpuRecordSource =
+        binding.sbsPreview.gpuRecordSource()
+
+    // 0.79.5: the controller spent its preview retries and the preview
+    // is black. Restart the camera ourselves (bounded) instead of
+    // making her reopen the app — the launch race usually clears on
+    // the next try. Only after the bound is spent do we show the error.
+    override fun onPreviewStartFailed() = onUi {
+        if (previewAutoRestarts < 2 && !isFinishing && !isDestroyed) {
+            previewAutoRestarts++
+            Log.i("MainActivity", "Preview start failed — auto-restarting camera ($previewAutoRestarts/2)")
+            controller.stop()
+            previewConfig = null
+            sbsPreviewActive = false
+            binding.sbsPreview.postDelayed({ maybeStartCamera() }, 500L)
+        } else {
+            toastOnUi("Preview couldn't start — please reopen the app.")
+            isRecording = false
+            isBusy = false
+            binding.stitchProgressCard.visibility = View.GONE
+            binding.stitchProgressBar.isIndeterminate = false
+            updateUi()
+        }
+    }
+
+    // 0.78.0: the phone refused the ultrawide preview stream. The
+    // controller already retried the ultra session reader-only, so photos
+    // and video still work — the preview just goes back to the wide lens
+    // alone, and the setting stays on for next time (a retry may work
+    // after a restart, and the user can also turn SBS preview off).
+    override fun onSbsPreviewFallback() = onUi {
+        sbsPreviewActive = false
+        binding.sbsPreview.setSbsMode(false, sbsViewCross)
+        applyPreviewAspectRatio()
+        toastOnUi("SBS preview unavailable — showing wide lens only")
+    }
+
+    // ---------------- Preview aspect ----------------
+    // 0.78.0: no TextureView transform anymore — the GL shader applies
+    // each texture's own transform matrix per frame. This only sizes the
+    // view so the shader's half-viewports don't stretch: SBS is two
+    // 4:3 eyes side by side (8:3); single-wide is one 4:3 eye (4:3 in
+    // landscape, 3:4 in portrait, from the real preview size).
     private fun applyPreviewAspectRatio() {
-        val cfg = previewConfig ?: return
+        val cfg = previewConfig
         val params =
-            binding.textureView.layoutParams as? ConstraintLayout.LayoutParams ?: return
-        val isLandscape =
-            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-        params.dimensionRatio = if (isLandscape) {
+            binding.sbsPreview.layoutParams as? ConstraintLayout.LayoutParams ?: return
+        params.dimensionRatio = if (sbsPreviewActive) {
+            "8:3"
+        } else if (cfg == null) {
+            "4:3"
+        } else if (resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE) {
             "${cfg.previewSize.width}:${cfg.previewSize.height}"
         } else {
             "${cfg.previewSize.height}:${cfg.previewSize.width}"
         }
-        binding.textureView.layoutParams = params
+        binding.sbsPreview.layoutParams = params
     }
 }

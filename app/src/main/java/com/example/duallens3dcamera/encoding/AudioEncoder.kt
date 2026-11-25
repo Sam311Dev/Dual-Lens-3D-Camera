@@ -29,21 +29,29 @@ class AudioEncoder(
 
     private var feedThread: Thread? = null
     private var drainThread: Thread? = null
+    private var captureThread: Thread? = null
 
     private val bufferInfo = MediaCodec.BufferInfo()
 
     @Volatile private var feedStopRequested = false
+    @Volatile private var captureStopRequested = false
     @Volatile private var eosQueued = false
     @Volatile private var started = false
     @Volatile private var capturing = false
 
     private var totalSamplesSubmitted: Long = 0L
+    private var droppedChunks: Long = 0L
 
     // PCM_16BIT => 2 bytes per sample * channelCount
     private val bytesPerFrame: Int
         get() = 2 * channelCount
 
-    private var tempBuffer: ByteArray = ByteArray(4096)
+    // 0.79.4: the mic is read on its own thread into this queue, so a
+    // slow codec / busy muxer can delay the audio but never lose mic
+    // samples. 32 x 8KB chunks ~= 2.7s of 48kHz mono 16-bit audio.
+    private val pcmQueue = java.util.concurrent.ArrayBlockingQueue<ByteArray>(32)
+    private val pcmChunkBytes: Int
+        get() = 8192
 
     /**
      * For logging
@@ -93,7 +101,9 @@ class AudioEncoder(
         }
 
         // Make it comfortably larger than min to reduce overruns.
-        val bufSize = (minBuf.coerceAtLeast(4096)) * 2
+        // 0.79.4: 4x, since the capture thread now reads the mic
+        // continuously and a brief codec stall must not overrun it.
+        val bufSize = (minBuf.coerceAtLeast(4096)) * 4
 
         audioRecord = try {
             AudioRecord(
@@ -111,9 +121,6 @@ class AudioEncoder(
             }
         }
 
-        // Feed chunks up to 16KB.
-        tempBuffer = ByteArray(minOf(bufSize, 16 * 1024))
-
         // Drain thread starts now so we quickly catch INFO_OUTPUT_FORMAT_CHANGED once input arrives.
         drainThread = Thread({ drainLoop() }, "$tag-Drain").also { it.start() }
 
@@ -124,6 +131,17 @@ class AudioEncoder(
     /**
      * Starts AudioRecord and begins feeding PCM into the AAC encoder.
      * Call this right after camera recording repeating request starts.
+     *
+     * 0.79.4: the mic is read on its own thread into a queue, and the
+     * feed thread pulls from the queue. The old loop waited for a
+     * codec input buffer BEFORE reading the mic and skipped the read
+     * entirely when none was free — while the muxer was busy with
+     * video the codec starved, the mic overran, and ~40% of the
+     * samples were silently dropped, so the audio track came out
+     * ~0.6x as long as the video and drifted from the picture. Now a
+     * slow codec can delay the audio but never lose mic samples; the
+     * presentation timestamps come from the submitted sample count,
+     * which now tracks real time, so the audio stays in sync.
      */
     @SuppressLint("MissingPermission") // Activity already requests/ensures RECORD_AUDIO at runtime.
     fun startCapturing() {
@@ -132,60 +150,98 @@ class AudioEncoder(
 
         capturing = true
         feedStopRequested = false
+        captureStopRequested = false
         eosQueued = false
         totalSamplesSubmitted = 0L
+        droppedChunks = 0L
+        pcmQueue.clear()
 
         val record = requireNotNull(audioRecord)
         val codecLocal = requireNotNull(codec)
 
-        feedThread = Thread({
-            try {
-                record.startRecording()
-            } catch (se: SecurityException) {
-                Log.e(tag, "AudioRecord.startRecording SecurityException: ${se.message}")
-                feedStopRequested = true
-            } catch (e: Exception) {
-                Log.e(tag, "AudioRecord.startRecording failed: ${e.message}")
-                feedStopRequested = true
+        try {
+            record.startRecording()
+        } catch (se: SecurityException) {
+            Log.e(tag, "AudioRecord.startRecording SecurityException: ${se.message}")
+            capturing = false
+            return
+        } catch (e: Exception) {
+            Log.e(tag, "AudioRecord.startRecording failed: ${e.message}")
+            capturing = false
+            return
+        }
+
+        // Capture thread: its only job is reading the mic. It never
+        // waits on the codec, so the mic is never starved.
+        captureThread = Thread({
+            val buf = ByteArray(pcmChunkBytes)
+            while (!captureStopRequested) {
+                val readBytes = try {
+                    record.read(buf, 0, buf.size)
+                } catch (e: Exception) {
+                    Log.w(tag, "AudioRecord.read failed: ${e.message}")
+                    AudioRecord.ERROR_INVALID_OPERATION
+                }
+                if (readBytes > 0) {
+                    val chunk = buf.copyOf(readBytes)
+                    if (!pcmQueue.offer(chunk)) {
+                        // Codec backed up for >~2.7s: drop the OLDEST
+                        // chunk (never the newest) and say so loudly.
+                        pcmQueue.poll()
+                        pcmQueue.offer(chunk)
+                        droppedChunks++
+                        Log.w(tag, "Audio PCM queue full — dropped oldest chunk (total $droppedChunks)")
+                    }
+                }
             }
+            try { record.stop() } catch (_: Exception) {}
+        }, "$tag-Capture").also { it.start() }
 
-            while (!feedStopRequested) {
-                val inIndex = codecLocal.dequeueInputBuffer(TIMEOUT_US)
-                if (inIndex < 0) continue
-
+        // Feed thread: pulls PCM from the queue and queues it into the
+        // codec, holding a chunk across codec waits instead of
+        // dropping it. On stop it drains the remaining queue, then EOS.
+        feedThread = Thread({
+            var pending: ByteArray? = null
+            var pendingOffset = 0
+            while (true) {
+                if (pending == null) {
+                    pending = try {
+                        pcmQueue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    } catch (_: InterruptedException) {
+                        null
+                    }
+                    pendingOffset = 0
+                    if (pending == null) {
+                        if (feedStopRequested && pcmQueue.isEmpty()) break
+                        continue
+                    }
+                }
+                val chunk = pending
+                val inIndex = try {
+                    codecLocal.dequeueInputBuffer(100_000L)
+                } catch (e: Exception) {
+                    Log.w(tag, "Audio dequeueInputBuffer failed: ${e.message}")
+                    break
+                }
+                if (inIndex < 0) {
+                    // No codec buffer free yet. On stop, drop the
+                    // pending chunk rather than hang forever.
+                    if (feedStopRequested) pending = null
+                    continue
+                }
                 val inBuf = codecLocal.getInputBuffer(inIndex)
                 if (inBuf == null) {
                     codecLocal.queueInputBuffer(inIndex, 0, 0, 0, 0)
                     continue
                 }
-
                 inBuf.clear()
-
-                val toRead = minOf(tempBuffer.size, inBuf.capacity())
-                val readBytes = try {
-                    record.read(tempBuffer, 0, toRead)
-                } catch (e: Exception) {
-                    Log.w(tag, "AudioRecord.read failed: ${e.message}")
-                    AudioRecord.ERROR_INVALID_OPERATION
-                }
-
+                val toWrite = minOf(chunk.size - pendingOffset, inBuf.capacity())
                 val ptsUs = (totalSamplesSubmitted * 1_000_000L) / sampleRate.toLong()
-
-                if (readBytes > 0) {
-                    inBuf.put(tempBuffer, 0, readBytes)
-                    codecLocal.queueInputBuffer(inIndex, 0, readBytes, ptsUs, 0)
-
-                    val frames = readBytes / bytesPerFrame
-                    totalSamplesSubmitted += frames.toLong()
-                } else {
-                    // Keep codec moving; don't advance timestamp.
-                    codecLocal.queueInputBuffer(inIndex, 0, 0, ptsUs, 0)
-                }
-            }
-
-            try {
-                record.stop()
-            } catch (_: Exception) {
+                inBuf.put(chunk, pendingOffset, toWrite)
+                codecLocal.queueInputBuffer(inIndex, 0, toWrite, ptsUs, 0)
+                totalSamplesSubmitted += (toWrite / bytesPerFrame).toLong()
+                pendingOffset += toWrite
+                if (pendingOffset >= chunk.size) pending = null
             }
 
             queueEos()
@@ -195,13 +251,22 @@ class AudioEncoder(
     }
 
     fun stopAndRelease() {
+        captureStopRequested = true
         feedStopRequested = true
 
         // Unblock any pending read().
         try { audioRecord?.stop() } catch (_: Exception) {}
 
-        try { feedThread?.join(3_000) } catch (_: Exception) {}
+        try { captureThread?.join(3_000) } catch (_: Exception) {}
+        captureThread = null
+
+        // The feed thread drains the remaining queue before EOS.
+        try { feedThread?.join(5_000) } catch (_: Exception) {}
         feedThread = null
+
+        if (droppedChunks > 0L) {
+            Log.w(tag, "Audio capture dropped $droppedChunks PCM chunks while stopping")
+        }
 
         // Ensure EOS even if feed thread didn’t manage to queue it.
         queueEos()

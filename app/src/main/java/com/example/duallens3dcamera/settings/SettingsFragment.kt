@@ -75,10 +75,11 @@ class SettingsFragment : PreferenceFragmentCompat() {
     private fun setupVideoRecordModePref() {
         val mode = findPreference<ListPreference>(AppSettings.KEY_VIDEO_RECORD_MODE) ?: return
         mode.entries = arrayOf(
+            "GPU SBS — records the live preview (fast, no stitch)",
             "Direct SBS — one finished video (waits ~1s to settle)",
             "Two streams, stitched after"
         )
-        mode.entryValues = arrayOf("direct", "stitched")
+        mode.entryValues = arrayOf("gpu", "direct", "stitched")
         mode.summaryProvider = ListPreference.SimpleSummaryProvider.getInstance()
     }
 

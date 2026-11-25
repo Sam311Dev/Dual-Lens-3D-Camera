@@ -11,16 +11,15 @@
     android:layout_height="match_parent"
     android:background="@android:color/black">
 
-    <!-- Preview: aspect-matched to the preview size (0.76.6) — the
-         Camera2Basic transform recipe assumes the view's aspect matches the
-         preview's, otherwise the fill step stretches. As tall as the screen
-         and as wide as the aspect allows, centered; the ratio is updated
-         from the real preview size at startup. -->
-    <TextureView
-        android:id="@+id/textureView"
+    <!-- Preview (0.78.0): GPU SBS view — both lenses, side by side. The
+         GL shader applies each texture's own transform per frame, so the
+         view only needs its aspect matched (8:3 for SBS, 4:3 single-wide);
+         the ratio is updated from the real preview mode at startup. -->
+    <com.example.duallens3dcamera.preview.SbsPreviewView
+        android:id="@+id/sbsPreview"
         android:layout_width="0dp"
         android:layout_height="0dp"
-        app:layout_constraintDimensionRatio="4:3"
+        app:layout_constraintDimensionRatio="8:3"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"

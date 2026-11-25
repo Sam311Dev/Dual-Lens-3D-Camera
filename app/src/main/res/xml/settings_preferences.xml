@@ -72,13 +72,13 @@
         <ListPreference
             android:key="video_color_match"
             android:title="SBS video color match"
-            android:summary="Which lens the stitched video's colors are synced to"
+            android:summary="Which lens the other is matched to — live preview and all video modes (GPU, Direct, stitched)"
             android:defaultValue="wide" />
 
         <ListPreference
             android:key="sbs_view"
             android:title="SBS view"
-            android:summary="Cross-eyed or parallel — which eye goes on the left. Applies to SBS photos and stitched SBS video"
+            android:summary="Cross-eyed or parallel — which eye goes on the left. Applies to SBS photos, stitched SBS video, and the SBS preview"
             android:defaultValue="cross" />
 
         <!-- (4) Optional video request processing controls -->
@@ -111,6 +111,18 @@
             android:key="preview_fps"
             android:title="Preview FPS"
             android:defaultValue="30" />
+
+        <androidx.preference.SwitchPreferenceCompat
+            android:key="sbs_preview_enabled"
+            android:title="Side-by-side preview"
+            android:summary="Show both lenses side by side in the live preview, composited on the GPU (cross/parallel follows SBS view). Falls back to the wide lens alone if the phone refuses the second preview stream"
+            android:defaultValue="true" />
+
+        <androidx.preference.SwitchPreferenceCompat
+            android:key="pair_frames"
+            android:title="Pair frames (less wiggle swim)"
+            android:summary="Wait for a fresh frame from both lenses before drawing the preview, so the two eyes stay in step when the camera moves. Off = draw each lens as its frames arrive, so one eye can lag the other by a frame. If one lens stalls, the preview still draws after a short wait."
+            android:defaultValue="true" />
     </PreferenceCategory>
 
     <!-- (1)(2)(3) Debug settings -->

@@ -41,6 +41,9 @@ object AppSettings {
     // *_sbs.mp4 straight from the two lenses (Moto dual-device only, with a
     // ~1s warm-up while the lenses settle); "stitched" (default) records two
     // separate MP4s and stitches them after, as before.
+    // (0.79.0): "gpu" records the live GL preview straight into the
+    // encoder — no warm-up, no CPU compose, no post-stitch — and is now
+    // the default on dual-device phones.
     const val KEY_VIDEO_RECORD_MODE = "video_record_mode"
 
     // MP4s into one side-by-side *_sbs.mp4 (aligned + color-matched). The two
@@ -60,6 +63,14 @@ object AppSettings {
 
     const val KEY_PREVIEW_RESOLUTION = "preview_resolution"
     const val KEY_PREVIEW_FPS = "preview_fps"
+    // GPU SBS preview (0.78.0): show both lenses side by side in the live
+    // preview, composited on the GPU. Off = wide lens alone, as before.
+    const val KEY_SBS_PREVIEW_ENABLED = "sbs_preview_enabled"
+    // Frame pairing (0.79.7): draw the preview only once BOTH lenses have
+    // a fresh frame since the last draw, so the two eyes stay in step when
+    // the camera wiggles. Off = draw each lens as its frames arrive (one
+    // eye can lag the other by a frame).
+    const val KEY_PAIR_FRAMES = "pair_frames"
 
     const val KEY_PHOTO_NOISE_REDUCTION = "photo_noise_reduction"
     const val KEY_PHOTO_DISTORTION_CORRECTION = "photo_distortion_correction"
@@ -197,9 +208,13 @@ object AppSettings {
     fun getVideoStitchSbsEnabled(context: Context): Boolean =
         prefs(context).getBoolean(KEY_VIDEO_STITCH_SBS, true)
 
-    /** "direct" or "stitched" (default). Direct is Moto dual-device only. */
+    /** "gpu" (default, 0.79.0), "direct" or "stitched". GPU and Direct
+     *  are Moto dual-device only. */
     fun getVideoRecordMode(context: Context): String =
-        prefs(context).getString(KEY_VIDEO_RECORD_MODE, "stitched") ?: "stitched"
+        prefs(context).getString(KEY_VIDEO_RECORD_MODE, "gpu") ?: "gpu"
+
+    fun isGpuRecordMode(context: Context): Boolean =
+        getVideoRecordMode(context) == "gpu"
 
     fun isDirectRecordMode(context: Context): Boolean =
         getVideoRecordMode(context) == "direct"
@@ -209,6 +224,12 @@ object AppSettings {
 
     fun getSbsView(context: Context): String =
         prefs(context).getString(KEY_SBS_VIEW, "cross") ?: "cross"
+
+    fun isSbsPreviewEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_SBS_PREVIEW_ENABLED, true)
+
+    fun isPairFramesEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_PAIR_FRAMES, true)
 
     fun isSbsParallel(context: Context): Boolean = getSbsView(context) == "parallel"
 
@@ -493,6 +514,12 @@ object AppSettings {
         }
         if (!sp.contains(KEY_SBS_VIEW)) {
             editor.putString(KEY_SBS_VIEW, "cross"); changed = true
+        }
+        if (!sp.contains(KEY_SBS_PREVIEW_ENABLED)) {
+            editor.putBoolean(KEY_SBS_PREVIEW_ENABLED, true); changed = true
+        }
+        if (!sp.contains(KEY_PAIR_FRAMES)) {
+            editor.putBoolean(KEY_PAIR_FRAMES, true); changed = true
         }
 
         // Video processing defaults (recording only).

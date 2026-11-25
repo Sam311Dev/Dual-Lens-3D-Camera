@@ -1,5 +1,6 @@
 package com.example.duallens3dcamera.camera
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Rect
 import android.graphics.SurfaceTexture
@@ -20,6 +21,8 @@ import android.view.Surface
 import com.example.duallens3dcamera.util.StereoSbs
 import com.example.duallens3dcamera.encoding.AudioEncoder
 import com.example.duallens3dcamera.encoding.DirectSbsRecorder
+import com.example.duallens3dcamera.encoding.GpuSbsRecorder
+import com.example.duallens3dcamera.preview.SbsPreviewView
 import com.example.duallens3dcamera.encoding.Mp4Muxer
 import com.example.duallens3dcamera.encoding.StereoVideoStitcher
 import com.example.duallens3dcamera.encoding.VideoEncoder
@@ -62,6 +65,25 @@ class StereoCameraController(
         /** Direct SBS mode (0.77.0): the cameras are running and the lenses
          *  are settling before encoding starts. */
         fun onDirectWarmup() {}
+        /** GPU SBS preview (0.78.0): the ultrawide preview stream was
+         *  refused, so the controller fell back to a reader-only ultra
+         *  session — the activity should switch the preview to wide-only. */
+        fun onSbsPreviewFallback() {}
+        /** GPU SBS preview (0.78.2): live color-match gains for the ultra
+         *  eye, relative to the wide eye (the reference). The activity
+         *  forwards them to the GL view; the wide eye stays un-gained. */
+        fun onPreviewColorGains(r: Float, g: Float, b: Float) {}
+        /** GPU SBS video (0.79.1): the preview view's record source —
+         *  its shared EGL context, frame signal and latest render state
+         *  — so the recorder can render the same SBS frame into the
+         *  encoder on its own thread. Null if the view has no GL context
+         *  yet (caller falls back to Direct). */
+        fun gpuRecordSource(): SbsPreviewView.GpuRecordSource? = null
+        /** Preview (0.79.5): the preview session failed and the bounded
+         *  retries are spent — the activity may restart the camera on
+         *  its own (bounded) instead of telling the user to reopen the
+         *  app. */
+        fun onPreviewStartFailed() {}
     }
 
     data class PreviewConfig(
@@ -108,6 +130,12 @@ class StereoCameraController(
 
     data class StartParams(
         val surfaceTexture: SurfaceTexture,
+        /** Second preview texture (GPU SBS preview, 0.78.0): the ultra
+         *  lens's SurfaceTexture from SbsPreviewView. Null in single-wide
+         *  mode and on logical rigs, where the ultra has no preview. */
+        val ultraSurfaceTexture: SurfaceTexture? = null,
+        /** Whether the activity wants the SBS preview at all. */
+        val sbsPreviewEnabled: Boolean = true,
         val displayRotation: Int,
         val rawMode: Boolean,
         val torchOn: Boolean,
@@ -188,6 +216,37 @@ class StereoCameraController(
 
     private var surfaceTexture: SurfaceTexture? = null
     private var previewSurface: Surface? = null
+    // GPU SBS preview (0.78.0): the ultrawide's preview texture/surface.
+    // Only used in dual-device mode when the activity asked for SBS.
+    private var ultraSurfaceTexture: SurfaceTexture? = null
+    private var ultraPreviewSurface: Surface? = null
+    private var sbsPreviewEnabled: Boolean = true
+    /** True while the ultra preview stream is actually running (i.e. the
+     *  ultra session was configured with the preview surface). Cleared by
+     *  the fallback path if the phone refuses that stream. */
+    @Volatile var sbsPreviewActive: Boolean = false
+        private set
+    private var ultraPreviewFallbackTried: Boolean = false
+    /** True while stop() is closing the cameras (set on the camera thread
+     *  before any close, cleared by the next start()). While it is true,
+     *  onDisconnected/onError from our own close must not toast — on some
+     *  devices the HAL reports the app's own close as a disconnect, which
+     *  is why a "Wide camera disconnected" toast appeared for a camera
+     *  that was working fine. */
+    private var stoppingCamera: Boolean = false
+    /** Bounded preview-open retries (0.79.0): how many times a failed
+     *  preview session creation has already been retried. */
+    private var previewRetryAttempts: Int = 0
+    /** Open generation (0.79.3): bumped on every openCamera(). A
+     *  delayed preview retry captures the generation of the failed
+     *  attempt and aborts if a newer open has already succeeded —
+     *  otherwise the retry closes the *working* devices/sessions of
+     *  the newer open and the preview goes black. */
+    private var previewOpenGeneration: Int = 0
+    /** Bounded per-device reopens (0.79.1): how many times the wide /
+     *  ultra has already been reopened after disconnecting mid-use. */
+    private var wideReopenAttempts: Int = 0
+    private var ultraReopenAttempts: Int = 0
 
     private var logicalChars: CameraCharacteristics? = null
     private var wideChars: CameraCharacteristics? = null
@@ -304,6 +363,11 @@ class StereoCameraController(
     // from both lenses. No per-lens encoders/muxers in this mode.
     private var isDirectRecording: Boolean = false
     private var directRecorder: DirectSbsRecorder? = null
+    // GPU SBS video (0.79.0): records the live GL preview straight into
+    // the encoder — no CPU frames, no warm-up, no post-stitch.
+    private var gpuRecorder: GpuSbsRecorder? = null
+    private var gpuVideoUri: Uri? = null
+    private var isGpuRecording: Boolean = false
     private var directVideoUri: Uri? = null
     private var directRecordingId: String? = null
     private var dualDirectWideReady: Boolean = false
@@ -319,7 +383,7 @@ class StereoCameraController(
         // Color-matched SBS variants (built from the aligned SBS bytes held in
         // memory): both eyes synced to the wide's colors, and both eyes synced
         // to the ultra's colors. The plain unmatched SBS is NOT saved anymore
-        // (the tester only wants the two matched versions). Null in RAW mode
+        // (only the two matched versions are saved). Null in RAW mode
         // (no SBS at all there).
         val sbsMatchedWideUri: Uri? = null,
         val sbsMatchedUltraUri: Uri? = null,
@@ -347,6 +411,15 @@ class StereoCameraController(
 
     fun start(params: StartParams): PreviewConfig {
         this.surfaceTexture = params.surfaceTexture
+        this.ultraSurfaceTexture = params.ultraSurfaceTexture
+        this.sbsPreviewEnabled = params.sbsPreviewEnabled
+        this.sbsPreviewActive = false
+        this.ultraPreviewFallbackTried = false
+        // A fresh start: any disconnect from here on is real, not our own close.
+        this.stoppingCamera = false
+        this.previewRetryAttempts = 0
+        this.wideReopenAttempts = 0
+        this.ultraReopenAttempts = 0
         this.displayRotation = params.displayRotation
         this.isRawMode = params.rawMode
         this.torchOn = params.torchOn
@@ -376,6 +449,13 @@ class StereoCameraController(
 
         params.surfaceTexture.setDefaultBufferSize(previewSize.width, previewSize.height)
         previewSurface = Surface(params.surfaceTexture)
+        // The ultra preview uses the same per-eye size as the wide preview
+        // (800x600 by default, so <=1280x720 — the mandatory concurrent
+        // combo [5] limit for a PRIVATE preview stream alongside a YUV one).
+        ultraPreviewSurface = params.ultraSurfaceTexture?.let { ultraSt ->
+            ultraSt.setDefaultBufferSize(previewSize.width, previewSize.height)
+            Surface(ultraSt)
+        }
 
         openCamera()
 
@@ -582,6 +662,9 @@ class StereoCameraController(
 
         val latch = CountDownLatch(1)
         handler.post {
+            // First, before any close: our own close must not report as
+            // a disconnect (see stoppingCamera).
+            stoppingCamera = true
             cancelPrimeUwLocked()
 
             try {
@@ -607,6 +690,10 @@ class StereoCameraController(
             try { previewSurface?.release() } catch (_: Exception) {}
             previewSurface = null
             surfaceTexture = null
+            try { ultraPreviewSurface?.release() } catch (_: Exception) {}
+            ultraPreviewSurface = null
+            ultraSurfaceTexture = null
+            sbsPreviewActive = false
 
             latch.countDown()
         }
@@ -918,7 +1005,27 @@ class StereoCameraController(
 
             isRecording = true
             currentRecordingId = timestampForFilename
-            closeReaders() // reduce load during recording
+
+            // 0.79.0: GPU SBS mode (Moto dual-device only) — records the
+            // live GL preview straight into the encoder, so there is no
+            // warm-up and no post-stitch. If it can't start, fall through
+            // to Direct, then to the two-stream path, with the same id.
+            // 0.79.3: the readers are NOT closed before the GPU branch.
+            // The ultra preview session's repeating request targets the
+            // ultra reader surface, so closing the readers tears the
+            // ultra stream down — the ultra froze / disconnected the
+            // moment recording started, while the wide (whose repeating
+            // request targets only the preview surface) kept going. GPU
+            // recording keeps the preview sessions running, so the
+            // readers must stay alive for the whole recording; Direct /
+            // two-stream replace the sessions and build their own
+            // readers, so they close them below.
+            if (AppSettings.isGpuRecordMode(context) && isDualDevice) {
+                if (tryStartGpuRecordingLocked(timestampForFilename)) return@post
+                callback.onStatus("GPU recording couldn't start — using Direct SBS")
+            }
+
+            closeReaders() // reduce load during recording (Direct / two-stream only)
 
             // 0.77.0: direct SBS mode (Moto dual-device only). If it can't
             // start, fall through to the two-stream path with the same id.
@@ -1091,6 +1198,83 @@ class StereoCameraController(
     }
 
     /**
+     * Start the GPU SBS flow. Returns true once the encoder is running
+     * and the GL view has been told to render into its input surface.
+     * The preview sessions are NOT touched — the preview itself is the
+     * source, so record start cannot disconnect a camera. Returns false
+     * if the encoder could not start (caller falls through to Direct).
+     */
+    private fun tryStartGpuRecordingLocked(timestampForFilename: String): Boolean {
+        val sbsSize = Size(previewSize.width * 2, previewSize.height)
+        // 0.79.1: the recorder renders on its own thread from the
+        // view's shared EGL context — without that source there is no
+        // GPU recording, so fall through to Direct.
+        val source = callback.gpuRecordSource()
+        if (source == null || source.sharedContext == null) {
+            Log.w(TAG, "GPU SBS: no record source from the preview view")
+            return false
+        }
+        return try {
+            val sbsUri = MediaStoreUtils.createPendingVideo(
+                context, "${timestampForFilename}_sbs.mp4", System.currentTimeMillis()
+            )
+            gpuVideoUri = sbsUri
+            val recorder = GpuSbsRecorder(
+                context = context,
+                outputUri = sbsUri,
+                sbsSize = sbsSize,
+                fps = requestedRecordFps,
+                bitrateBps = videoBitrateBps * 2
+            )
+            if (!recorder.startEncoding(source)) {
+                recorder.releaseOnFailure()
+                gpuVideoUri = null
+                return false
+            }
+            gpuRecorder = recorder
+            isGpuRecording = true
+            callback.onRecordingStarted()
+            Log.i(TAG, "GPU SBS recording started ${sbsSize.width}x${sbsSize.height}")
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "GPU SBS setup failed: ${e.message}", e)
+            gpuRecorder = null
+            gpuVideoUri = null
+            false
+        }
+    }
+
+    /**
+     * Stop a GPU recording: stop rendering into the encoder surface,
+     * finalize the single SBS file on a background thread, report the
+     * frame count. The preview sessions were never stopped, so there is
+     * nothing to restore.
+     */
+    private fun stopGpuRecordingLocked() {
+        val recorder = gpuRecorder
+        gpuRecorder = null
+        gpuVideoUri = null
+        isGpuRecording = false
+        isRecording = false
+        // 0.79.1: the recorder's render thread stops itself when the
+        // recorder stops — nothing to tell the view any more.
+        encodingExecutor.execute {
+            val frames = try {
+                recorder?.stopAndFinalize() ?: 0
+            } catch (e: Exception) {
+                Log.w(TAG, "GPU SBS finalize failed: ${e.message}", e)
+                0
+            }
+            if (frames > 0) {
+                callback.onStatus("3D video saved ($frames frames)")
+            } else {
+                callback.onStatus("GPU recording saved no frames — check the video")
+            }
+            callback.onRecordingStopped()
+        }
+    }
+
+    /**
      * Start the direct SBS flow. Returns true once the direct record
      * sessions are being created (warm-up + encoding follow asynchronously);
      * false if direct can't start at all (caller falls through to the
@@ -1200,11 +1384,14 @@ class StereoCameraController(
         }
 
         // --- Wide direct session: preview + wide YUV reader ---
-        val wideOutputs = ArrayList<OutputConfiguration>(2).apply {
+        val wideOutputs = safeOutputConfigs {
             add(OutputConfiguration(preview))
             add(OutputConfiguration(recorder.wideReader.surface))
+        } ?: run {
+            onDirectSessionFailed(IllegalArgumentException("preview surface abandoned"))
+            return
         }
-        wideCamera.createCaptureSessionByOutputConfigurations(
+        createSessionSafe(wideCamera, 
             wideOutputs,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(sess: CameraCaptureSession) {
@@ -1236,14 +1423,20 @@ class StereoCameraController(
                     fallbackDirectToStitched()
                 }
             },
-            handler
+            handler, { e -> onDirectSessionFailed(e) }
         )
 
-        // --- Ultra direct session: ultra YUV reader only ---
-        val ultraOutputs = ArrayList<OutputConfiguration>(1).apply {
+        // --- Ultra direct session: ultra YUV reader (+ ultra preview, so
+        //  the GPU SBS preview stays live while recording) ---
+        val ultraPreviewDirect = if (sbsPreviewActive) ultraPreviewSurface else null
+        val ultraOutputs = safeOutputConfigs {
             add(OutputConfiguration(recorder.ultraReader.surface))
+            if (ultraPreviewDirect != null) add(OutputConfiguration(ultraPreviewDirect))
+        } ?: run {
+            onDirectSessionFailed(IllegalArgumentException("ultra preview surface abandoned"))
+            return
         }
-        ultraCamera.createCaptureSessionByOutputConfigurations(
+        createSessionSafe(ultraCamera, 
             ultraOutputs,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(sess: CameraCaptureSession) {
@@ -1251,6 +1444,7 @@ class StereoCameraController(
                     try {
                         val builder = ultraCamera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                             addTarget(recorder.ultraReader.surface)
+                            if (ultraPreviewDirect != null) addTarget(ultraPreviewDirect)
                             applyCommonNoCropNoStab(this, isVideo = true, targetFps = requestedRecordFps, forUltraDevice = true)
                             applyZoomCrop(this, ultraChars)
                             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
@@ -1274,7 +1468,7 @@ class StereoCameraController(
                     fallbackDirectToStitched()
                 }
             },
-            handler
+            handler, { e -> onDirectSessionFailed(e) }
         )
     }
 
@@ -1377,6 +1571,12 @@ class StereoCameraController(
         handler.post {
             if (!isRecording) {
                 callback.onRecordingStopped()
+                return@post
+            }
+
+            // 0.79.0: GPU SBS mode has its own stop path (single file, no stitch).
+            if (isGpuRecording) {
+                stopGpuRecordingLocked()
                 return@post
             }
 
@@ -1705,6 +1905,7 @@ class StereoCameraController(
     }
 
     private fun openCamera() {
+        previewOpenGeneration++
         val handler = requireNotNull(cameraHandler)
         if (isDualDevice) {
             openDualCameras(handler)
@@ -1718,15 +1919,20 @@ class StereoCameraController(
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
+                    // 0.79.0: ignore a disconnect for a device that is no
+                    // longer current — a stale callback from a previous
+                    // open/close must not toast for the working camera.
+                    if (camera !== cameraDevice) return
                     try { camera.close() } catch (_: Exception) {}
                     cameraDevice = null
-                    callback.onError("Camera disconnected.")
+                    if (!stoppingCamera) callback.onError("Camera disconnected.")
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
+                    if (camera !== cameraDevice) return
                     try { camera.close() } catch (_: Exception) {}
                     cameraDevice = null
-                    callback.onError("Camera error: $error")
+                    if (!stoppingCamera) callback.onError("Camera error: $error")
                 }
             }, handler)
         } catch (se: SecurityException) {
@@ -1737,61 +1943,18 @@ class StereoCameraController(
     }
 
     /**
-     * MOTO dual-device open: wide first, then ultrawide. The two cameras are
-     * independent HAL pipelines — if the second open disconnects the first (some
-     * phones refuse concurrent opens despite the direct-open test passing), the
-     * error surfaces here and the user gets a clear message instead of a hang.
-     * Preview sessions are created only once BOTH devices are open.
+     * MOTO dual-device open (0.79.1): wide first, and the wide preview
+     * session is built before the ultra is even opened — opening the
+     * ultra while the wide was idle is what disconnected the wide
+     * (crash logs). The ultra is opened from the wide session's
+     * onConfigured (see createPreviewSession / maybeOpenUltraLocked),
+     * and each device that disconnects mid-use is reopened on its own,
+     * bounded, instead of tearing the whole open down.
      */
     private fun openDualCameras(handler: Handler) {
         try {
             dualUltraOpening = false
-            cameraManager.openCamera(widePhysicalId, object : CameraDevice.StateCallback() {
-                override fun onOpened(camera: CameraDevice) {
-                    cameraDevice = camera
-                    Log.i(TAG, "Moto dual: wide camera $widePhysicalId opened, opening ultra $ultraPhysicalId")
-                    dualUltraOpening = true
-                    try {
-                        cameraManager.openCamera(ultraPhysicalId, object : CameraDevice.StateCallback() {
-                            override fun onOpened(ultraCamera: CameraDevice) {
-                                dualUltraOpening = false
-                                ultraCameraDevice = ultraCamera
-                                Log.i(TAG, "Moto dual: ultra camera $ultraPhysicalId opened")
-                                createPreviewSession()
-                            }
-
-                            override fun onDisconnected(ultraCamera: CameraDevice) {
-                                dualUltraOpening = false
-                                try { ultraCamera.close() } catch (_: Exception) {}
-                                ultraCameraDevice = null
-                                callback.onError("Ultrawide camera disconnected (Moto dual-device).")
-                            }
-
-                            override fun onError(ultraCamera: CameraDevice, error: Int) {
-                                dualUltraOpening = false
-                                try { ultraCamera.close() } catch (_: Exception) {}
-                                ultraCameraDevice = null
-                                callback.onError("Ultrawide camera error: $error (Moto dual-device).")
-                            }
-                        }, handler)
-                    } catch (e: Exception) {
-                        dualUltraOpening = false
-                        callback.onError("Opening ultrawide camera failed: ${e.message}")
-                    }
-                }
-
-                override fun onDisconnected(camera: CameraDevice) {
-                    try { camera.close() } catch (_: Exception) {}
-                    cameraDevice = null
-                    callback.onError("Wide camera disconnected (Moto dual-device).")
-                }
-
-                override fun onError(camera: CameraDevice, error: Int) {
-                    try { camera.close() } catch (_: Exception) {}
-                    cameraDevice = null
-                    callback.onError("Wide camera error: $error (Moto dual-device).")
-                }
-            }, handler)
+            openWideCamera(handler) { createPreviewSession() }
         } catch (se: SecurityException) {
             callback.onError("Missing CAMERA permission.")
         } catch (e: Exception) {
@@ -1799,16 +1962,310 @@ class StereoCameraController(
         }
     }
 
+    /** Open the wide camera; [afterOpened] runs on the camera thread
+     *  once it is open (initial open: start the preview, which builds
+     *  the wide session and then opens the ultra; wide reopen: rebuild
+     *  just the wide session, the ultra keeps streaming). The CAMERA
+     *  permission is checked by the activity before start(); a
+     *  SecurityException from openCamera is caught by the caller. */
+    @SuppressLint("MissingPermission")
+    private fun openWideCamera(handler: Handler, afterOpened: () -> Unit) {
+        // 0.79.3: any device open invalidates a pending preview retry.
+        previewOpenGeneration++
+        cameraManager.openCamera(widePhysicalId, object : CameraDevice.StateCallback() {
+            override fun onOpened(camera: CameraDevice) {
+                cameraDevice = camera
+                Log.i(TAG, "Moto dual: wide camera $widePhysicalId opened")
+                afterOpened()
+            }
+
+            override fun onDisconnected(camera: CameraDevice) {
+                // 0.79.0: a stale wide device (previous open) disconnecting
+                // late must not toast — or null out the working camera.
+                if (camera !== cameraDevice) return
+                try { camera.close() } catch (_: Exception) {}
+                cameraDevice = null
+                // 0.79.1: if the ultra is already streaming, the wide
+                // dying is recoverable — reopen it on its own, quietly,
+                // instead of toasting and leaving a one-eye preview.
+                if (!stoppingCamera && ultraCameraDevice != null) {
+                    scheduleWideReopen()
+                    return
+                }
+                // 0.79.6: the wide died before the ultra was open
+                // (usually the HAL race at launch, while the ultra was
+                // still opening). Don't toast — a toast for a
+                // self-healing hiccup is noise, and the old toast left
+                // the preview with no recovery at all. Route through
+                // the same bounded, silent retry as a session failure.
+                if (!stoppingCamera) {
+                    onPreviewSessionFailed(
+                        "Wide preview",
+                        CameraAccessException(
+                            CameraAccessException.CAMERA_DISCONNECTED,
+                            "wide disconnected before ultra opened"
+                        )
+                    )
+                }
+            }
+
+            override fun onError(camera: CameraDevice, error: Int) {
+                if (camera !== cameraDevice) return
+                try { camera.close() } catch (_: Exception) {}
+                cameraDevice = null
+                if (!stoppingCamera && ultraCameraDevice != null) {
+                    scheduleWideReopen()
+                    return
+                }
+                // 0.79.6: same as onDisconnected above — silent retry,
+                // not a toast.
+                if (!stoppingCamera) {
+                    onPreviewSessionFailed(
+                        "Wide preview",
+                        CameraAccessException(
+                            CameraAccessException.CAMERA_ERROR,
+                            "wide error $error before ultra opened"
+                        )
+                    )
+                }
+            }
+        }, handler)
+    }
+
+    /** Open the ultra, but only once the wide session is streaming.
+     *  No-op if the ultra is already open or opening. The CAMERA
+     *  permission is checked by the activity before start(); the
+     *  openCamera call below is wrapped in a try/catch. */
+    @SuppressLint("MissingPermission")
+    private fun maybeOpenUltraLocked() {
+        val handler = cameraHandler ?: return
+        if (stoppingCamera) return
+        if (ultraCameraDevice != null || dualUltraOpening) return
+        if (cameraDevice == null || session == null) return
+        dualUltraOpening = true
+        // 0.79.3: any device open invalidates a pending preview retry.
+        previewOpenGeneration++
+        Log.i(TAG, "Moto dual: wide streaming, opening ultra $ultraPhysicalId")
+        try {
+            cameraManager.openCamera(ultraPhysicalId, object : CameraDevice.StateCallback() {
+                override fun onOpened(ultraCamera: CameraDevice) {
+                    dualUltraOpening = false
+                    ultraCameraDevice = ultraCamera
+                    ultraReopenAttempts = 0
+                    Log.i(TAG, "Moto dual: ultra camera $ultraPhysicalId opened")
+                    createDualUltraPreviewSession(includePreview = sbsPreviewEnabled && ultraPreviewSurface != null)
+                }
+
+                override fun onDisconnected(ultraCamera: CameraDevice) {
+                    if (ultraCamera !== ultraCameraDevice) return
+                    dualUltraOpening = false
+                    try { ultraCamera.close() } catch (_: Exception) {}
+                    val hadSession = ultraSession != null
+                    ultraCameraDevice = null
+                    if (stoppingCamera) return
+                    // 0.79.1: the ultra dying mid-use freezes its half on
+                    // the last frame — reopen it on its own, quietly,
+                    // instead of leaving a frozen eye. If it never had a
+                    // session (initial open), one quiet retry, then stay
+                    // wide-only.
+                    if (hadSession) {
+                        scheduleUltraReopen()
+                    } else if (ultraReopenAttempts < 1) {
+                        ultraReopenAttempts++
+                        cameraHandler?.postDelayed({ maybeOpenUltraLocked() }, 500L)
+                    } else {
+                        callback.onStatus("Ultrawide unavailable — wide only")
+                    }
+                }
+
+                override fun onError(ultraCamera: CameraDevice, error: Int) {
+                    if (ultraCamera !== ultraCameraDevice) return
+                    dualUltraOpening = false
+                    try { ultraCamera.close() } catch (_: Exception) {}
+                    val hadSession = ultraSession != null
+                    ultraCameraDevice = null
+                    if (stoppingCamera) return
+                    if (hadSession) {
+                        scheduleUltraReopen()
+                    } else if (ultraReopenAttempts < 1) {
+                        ultraReopenAttempts++
+                        cameraHandler?.postDelayed({ maybeOpenUltraLocked() }, 500L)
+                    } else {
+                        callback.onStatus("Ultrawide unavailable — wide only")
+                    }
+                }
+            }, handler)
+        } catch (e: Exception) {
+            dualUltraOpening = false
+            callback.onError("Opening ultrawide camera failed: ${e.message}")
+        }
+    }
+
+    /** Reopen the wide on its own after it disconnected mid-use, while
+     *  the ultra keeps streaming. Bounded; gives up with one error. */
+    private fun scheduleWideReopen() {
+        val handler = cameraHandler ?: return
+        if (stoppingCamera) return
+        if (wideReopenAttempts >= 2) {
+            wideReopenAttempts = 0
+            callback.onError("Wide camera disconnected (Moto dual-device).")
+            return
+        }
+        wideReopenAttempts++
+        Log.w(TAG, "Wide disconnected mid-use — reopening (attempt $wideReopenAttempts/2)")
+        handler.postDelayed({
+            if (stoppingCamera) return@postDelayed
+            if (cameraDevice != null || ultraCameraDevice == null) return@postDelayed
+            try {
+                openWideCamera(handler) { createWidePreviewSession(preserveUltra = true) }
+            } catch (e: Exception) {
+                callback.onError("Reopening wide camera failed: ${e.message}")
+            }
+        }, 300L)
+    }
+
+    /** Reopen the ultra on its own after it disconnected mid-use, while
+     *  the wide keeps streaming. Bounded; gives up wide-only. */
+    private fun scheduleUltraReopen() {
+        val handler = cameraHandler ?: return
+        if (stoppingCamera) return
+        if (ultraReopenAttempts >= 2) {
+            ultraReopenAttempts = 0
+            callback.onStatus("Ultrawide unavailable — wide only")
+            return
+        }
+        ultraReopenAttempts++
+        Log.w(TAG, "Ultra disconnected mid-use — reopening (attempt $ultraReopenAttempts/2)")
+        handler.postDelayed({ maybeOpenUltraLocked() }, 300L)
+    }
+
+    /**
+     * 0.79.0 — the crash fix. `createCaptureSessionByOutputConfigurations`
+     * throws CameraAccessException *synchronously* when the device was
+     * disconnected in the meantime (four crash logs, all on the
+     * CameraThread, all in createDualPreviewSessions: CAMERA_DISCONNECTED
+     * x3 and CAMERA_ERROR -38 endConfigure x1). Nothing caught it, so it
+     * killed the camera thread and the app. Every call site now goes
+     * through here: the throw becomes a logged failure callback instead
+     * of a process death.
+     */
+    private fun createSessionSafe(
+        device: CameraDevice,
+        outputs: List<OutputConfiguration>,
+        stateCallback: CameraCaptureSession.StateCallback,
+        handler: Handler,
+        onFailure: (Exception) -> Unit
+    ) {
+        try {
+            device.createCaptureSessionByOutputConfigurations(outputs, stateCallback, handler)
+        } catch (e: Exception) {
+            Log.e(TAG, "createCaptureSession failed: ${e.message}", e)
+            onFailure(e)
+        }
+    }
+
+    /**
+     * 0.79.2 — the same class of crash as createSessionSafe, one layer
+     * earlier. `OutputConfiguration(surface)` throws
+     * IllegalArgumentException ("Surface was abandoned") synchronously
+     * when the surface's SurfaceTexture was released — a 0.79.1
+     * crash log: the GL view recreated its textures (releasing the old
+     * pair) while a camera open was still in flight with the old
+     * preview surface, and createWidePreviewSession died building the
+     * outputs. Build the list through here instead: an abandoned
+     * surface returns null, and the caller routes it to the same
+     * bounded retry / fallback as a session-creation failure instead
+     * of killing the CameraThread.
+     */
+    private fun safeOutputConfigs(
+        build: MutableList<OutputConfiguration>.() -> Unit
+    ): ArrayList<OutputConfiguration>? {
+        return try {
+            ArrayList<OutputConfiguration>().apply(build)
+        } catch (e: IllegalArgumentException) {
+            Log.w(TAG, "OutputConfiguration failed (abandoned surface?): ${e.message}")
+            null
+        }
+    }
+
+    /** A preview session could not be created (usually because the wide
+     *  was disconnected while the ultra was opening — the Moto HAL race).
+     *  Retry the whole open, bounded, after a short delay; the retry
+     *  closes both devices first, so a stale disconnect from the closing
+     *  is ignored by the identity guard in the callbacks. */
+    private fun onPreviewSessionFailed(which: String, e: Exception) {
+        val handler = cameraHandler ?: return
+        if (stoppingCamera) return
+        if (previewRetryAttempts >= 4) {
+            previewRetryAttempts = 0
+            callback.onPreviewStartFailed()
+            return
+        }
+        previewRetryAttempts++
+        Log.w(TAG, "$which session failed (${e.message}) — retry ${previewRetryAttempts}/4")
+        // 0.79.5: no toast for a transient retry — the user only ever
+        // saw a scary pop-up for something that usually recovers on
+        // its own. Close the failed devices NOW, so the HAL starts
+        // tearing them down, and reopen after a delay so it has time
+        // to release them (the old code closed and reopened
+        // back-to-back, re-running the same HAL race that killed the
+        // session in the first place).
+        try { session?.close() } catch (_: Exception) {}
+        session = null
+        try { ultraSession?.close() } catch (_: Exception) {}
+        ultraSession = null
+        try { cameraDevice?.close() } catch (_: Exception) {}
+        cameraDevice = null
+        try { ultraCameraDevice?.close() } catch (_: Exception) {}
+        ultraCameraDevice = null
+        // 0.79.3: capture the generation of this failed attempt. If a
+        // newer open has already succeeded by the time this fires (the
+        // activity restarting the camera with fresh textures), abort —
+        // reopening now would disturb the working preview.
+        val retryGeneration = previewOpenGeneration
+        handler.postDelayed({
+            if (stoppingCamera) return@postDelayed
+            if (previewOpenGeneration != retryGeneration) {
+                Log.i(TAG, "Preview retry aborted — a newer open already succeeded")
+                return@postDelayed
+            }
+            openCamera()
+        }, 800L)
+    }
+
+    /** A direct-record session could not even be created: fall through to
+     *  the two-stream path, exactly as a warm-up failure does. */
+    private fun onDirectSessionFailed(e: Exception) {
+        Log.w(TAG, "Direct record session failed: ${e.message}", e)
+        if (isDirectRecording) fallbackDirectToStitched()
+    }
+
     private fun createPreviewSession() {
 
         // make sure preview aspect doesn't get messed up
         surfaceTexture?.setDefaultBufferSize(previewSize.width, previewSize.height)
 
-        val camera = cameraDevice ?: return
+        // 0.79.0: if a device vanished before the session could be built
+        // (the wide disconnecting while the ultra opens), do not silently
+        // return with no preview — retry the open, bounded, like a
+        // session-creation failure.
+        val camera = cameraDevice ?: run {
+            onPreviewSessionFailed("Preview", CameraAccessException(CameraAccessException.CAMERA_DISCONNECTED, "wide camera gone before session"))
+            return
+        }
         val handler = requireNotNull(cameraHandler)
         val preview = previewSurface ?: return
 
         if (isDualDevice) {
+            // 0.79.1: serialized open — if the ultra is not open yet, do
+            // NOT wait for it. Build the wide session first and let it
+            // start streaming; the ultra is opened only once the wide is
+            // running (see createWidePreviewSession). Opening the ultra
+            // while the wide was idle is what disconnected the wide.
+            if (ultraCameraDevice == null) {
+                createWidePreviewSession(afterConfigured = { maybeOpenUltraLocked() })
+                return
+            }
             createDualPreviewSessions()
             return
         }
@@ -1853,13 +2310,16 @@ class StereoCameraController(
             setOnImageAvailableListener({ reader -> onStillImageAvailable(isWide = false, reader = reader) }, handler)
         }
 
-        val outputs = ArrayList<OutputConfiguration>(3).apply {
+        val outputs = safeOutputConfigs {
             add(OutputConfiguration(preview).apply { setPhysicalCameraId(widePhysicalId) })
             add(OutputConfiguration(requireNotNull(wideReader).surface).apply { setPhysicalCameraId(widePhysicalId) })
             add(OutputConfiguration(requireNotNull(ultraReader).surface).apply { setPhysicalCameraId(ultraPhysicalId) })
+        } ?: run {
+            onPreviewSessionFailed("Preview", IllegalArgumentException("preview surface abandoned"))
+            return
         }
 
-        camera.createCaptureSessionByOutputConfigurations(
+        createSessionSafe(camera, 
             outputs,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(sess: CameraCaptureSession) {
@@ -1907,24 +2367,84 @@ class StereoCameraController(
                     callback.onError("Preview session configure failed.")
                 }
             },
-            handler
+            handler, { e -> onPreviewSessionFailed("Preview", e) }
         )
     }
 
 
     /**
+     * 0.78.2 live preview color match — DISABLED in 0.79.9. The AWB
+     * gain + exposure ratio did nothing: the lenses report near-equal
+     * gains, and the visible warm/cool difference lives in the
+     * sensors' color science, not the white balance — so the setting
+     * "didn't do anything" for the preview or GPU video. The preview
+     * now measures its own color match from the framebuffer
+     * (SbsPreviewView.measureAndUpdateColorMatch) and applies it
+     * itself. This stays a no-op so the capture callbacks remain
+     * attached to the preview sessions; the parameters are unused.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    private fun onPreviewCaptureResult(isWide: Boolean, result: TotalCaptureResult) {
+        // No-op (see above).
+    }
+
+    private val previewColorCallbackWide = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            onPreviewCaptureResult(isWide = true, result = result)
+        }
+    }
+
+    private val previewColorCallbackUltra = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            onPreviewCaptureResult(isWide = false, result = result)
+        }
+    }
+
+    /**
      * MOTO dual-device preview: two independent sessions.
      *  - Wide session: preview Surface + wide ImageReader. Repeating request is the
      *    normal preview (preview target only).
-     *  - Ultra session: ultra ImageReader only. Its repeating request targets the
-     *    reader surface so the ultrawide keeps running continuous AF/AE while idle
-     *    (otherwise the first still capture would be slow / out of focus). Frames
-     *    arriving with no photo in flight are discarded by onStillImageAvailable().
+     *  - Ultra session: ultra ImageReader + (0.78.0, when SBS preview is on)
+     *    the ultra preview Surface, so the GPU preview has a live second eye.
+     *    Its repeating request targets the reader surface so the ultrawide
+     *    keeps running continuous AF/AE while idle (otherwise the first
+     *    still capture would be slow / out of focus). Frames arriving with
+     *    no photo in flight are discarded by onStillImageAvailable().
+     *    If the phone refuses the extra preview stream, the ultra session
+     *    is retried reader-only and the activity falls back to wide-only.
      * No setPhysicalCameraId() anywhere — these are standalone devices.
      */
+    /** Both preview sessions (restore path — both devices are already
+     *  open and stable, e.g. after a recording stops). */
     private fun createDualPreviewSessions() {
+        createWidePreviewSession()
+        createDualUltraPreviewSession(includePreview = sbsPreviewEnabled && ultraPreviewSurface != null)
+    }
+
+    /**
+     * Wide preview session only: preview + wide still reader (0.79.1).
+     * Split out of createDualPreviewSessions so the wide can be
+     * streaming *before* the ultra is even opened — opening the ultra
+     * while the wide was idle is what disconnected the wide (crash
+     * logs). [afterConfigured] runs once the wide repeating
+     * request is running; createPreviewSession uses it to open the
+     * ultra. When [preserveUltra] is true (reopening the wide while the
+     * ultra session is still streaming), the ultra session and its
+     * reader are left strictly alone.
+     */
+    private fun createWidePreviewSession(
+        afterConfigured: (() -> Unit)? = null,
+        preserveUltra: Boolean = false
+    ) {
         val wideCamera = cameraDevice ?: return
-        val ultraCamera = ultraCameraDevice ?: return
         val handler = requireNotNull(cameraHandler)
         val preview = previewSurface ?: return
 
@@ -1932,12 +2452,19 @@ class StereoCameraController(
         session = null
         repeatingBuilder = null
         recordCaptureCallback = null
-        try { ultraSession?.close() } catch (_: Exception) {}
-        ultraSession = null
-        ultraRepeatingBuilder = null
+        if (!preserveUltra) {
+            try { ultraSession?.close() } catch (_: Exception) {}
+            ultraSession = null
+            ultraRepeatingBuilder = null
+        }
 
         cancelPrimeUwLocked()
-        closeReaders()
+        if (preserveUltra) {
+            try { wideReader?.close() } catch (_: Exception) {}
+            wideReader = null
+        } else {
+            closeReaders()
+        }
 
         val raw = isRawMode
         val (format, wideSize, ultraSize) = if (raw) {
@@ -1959,20 +2486,26 @@ class StereoCameraController(
         wideReader = ImageReader.newInstance(wideSize.width, wideSize.height, format, maxImages).apply {
             setOnImageAvailableListener({ reader -> onStillImageAvailable(isWide = true, reader = reader) }, handler)
         }
-        ultraReader = ImageReader.newInstance(ultraSize.width, ultraSize.height, format, maxImages).apply {
-            setOnImageAvailableListener({ reader -> onStillImageAvailable(isWide = false, reader = reader) }, handler)
+        if (!preserveUltra) {
+            ultraReader = ImageReader.newInstance(ultraSize.width, ultraSize.height, format, maxImages).apply {
+                setOnImageAvailableListener({ reader -> onStillImageAvailable(isWide = false, reader = reader) }, handler)
+            }
         }
 
         // --- Wide session: preview + wide still reader ---
-        val wideOutputs = ArrayList<OutputConfiguration>(2).apply {
+        val wideOutputs = safeOutputConfigs {
             add(OutputConfiguration(preview))
             add(OutputConfiguration(requireNotNull(wideReader).surface))
+        } ?: run {
+            onPreviewSessionFailed("Wide preview", IllegalArgumentException("preview surface abandoned"))
+            return
         }
-        wideCamera.createCaptureSessionByOutputConfigurations(
+        createSessionSafe(wideCamera,
             wideOutputs,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(sess: CameraCaptureSession) {
                     session = sess
+                    wideReopenAttempts = 0
                     try {
                         val builder = wideCamera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                             addTarget(preview)
@@ -1986,12 +2519,13 @@ class StereoCameraController(
                             applyTorch(this)
                         }
                         repeatingBuilder = builder
-                        sess.setRepeatingRequest(builder.build(), null, handler)
+                        sess.setRepeatingRequest(builder.build(), previewColorCallbackWide, handler)
                         if (primeUwOnActiveEnabled) {
                             primeUwPending = true
                             handler.removeCallbacks(primeUwRunnable)
                             handler.post(primeUwRunnable)
                         }
+                        afterConfigured?.invoke()
                     } catch (e: Exception) {
                         callback.onError("Wide preview repeating request failed: ${e.message}")
                         Log.e(TAG, "Wide preview repeating request failed: ${e.message}", e)
@@ -1999,25 +2533,55 @@ class StereoCameraController(
                 }
 
                 override fun onConfigureFailed(sess: CameraCaptureSession) {
-                    callback.onError("Wide preview session configure failed (Moto dual-device).")
+                    // 0.79.6: a configure failure is the same HAL race as
+                    // a thrown session creation — retry it silently
+                    // instead of toasting and leaving a black preview.
+                    // (The createSessionSafe onFailure above only fires
+                    // when the create call throws; an async configure
+                    // failure used to fall through here with no retry.)
+                    onPreviewSessionFailed(
+                        "Wide preview",
+                        CameraAccessException(
+                            CameraAccessException.CAMERA_DISCONNECTED,
+                            "wide session configure failed"
+                        )
+                    )
                 }
             },
-            handler
+            handler, { e -> onPreviewSessionFailed("Wide preview", e) }
         )
+    }
 
-        // --- Ultra session: ultra still reader only ---
-        val ultraOutputs = ArrayList<OutputConfiguration>(1).apply {
+    /** Ultra preview session, with or without the preview surface. Split out
+     *  so a configure failure with the preview can retry reader-only. */
+    private fun createDualUltraPreviewSession(includePreview: Boolean) {
+        val ultraCamera = ultraCameraDevice ?: return
+        val handler = requireNotNull(cameraHandler)
+        val ultraPreview = if (includePreview) ultraPreviewSurface else null
+        // The retry path re-enters here after closing the failed session;
+        // the wide session is untouched.
+        try { ultraSession?.close() } catch (_: Exception) {}
+        ultraSession = null
+        ultraRepeatingBuilder = null
+
+        val ultraOutputs = safeOutputConfigs {
             add(OutputConfiguration(requireNotNull(ultraReader).surface))
+            if (ultraPreview != null) add(OutputConfiguration(ultraPreview))
+        } ?: run {
+            onPreviewSessionFailed("Ultra preview", IllegalArgumentException("ultra preview surface abandoned"))
+            return
         }
-        ultraCamera.createCaptureSessionByOutputConfigurations(
+        createSessionSafe(ultraCamera, 
             ultraOutputs,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(sess: CameraCaptureSession) {
                     ultraSession = sess
+                    sbsPreviewActive = ultraPreview != null
                     try {
                         val ultraSurface = requireNotNull(ultraReader).surface
                         val builder = ultraCamera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                             addTarget(ultraSurface)
+                            if (ultraPreview != null) addTarget(ultraPreview)
                             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                             set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
                             applyCommonNoCropNoStab(this, isVideo = false, targetFps = previewTargetFps, applyFpsRange = false, forUltraDevice = true)
@@ -2029,19 +2593,35 @@ class StereoCameraController(
                             // wide camera and is already driven from the wide session.
                         }
                         ultraRepeatingBuilder = builder
-                        sess.setRepeatingRequest(builder.build(), null, handler)
+                        sess.setRepeatingRequest(builder.build(), previewColorCallbackUltra, handler)
                     } catch (e: Exception) {
                         callback.onError("Ultra preview repeating request failed: ${e.message}")
                         Log.e(TAG, "Ultra preview repeating request failed: ${e.message}", e)
+                        if (ultraPreview != null) fallbackUltraPreview()
                     }
                 }
 
                 override fun onConfigureFailed(sess: CameraCaptureSession) {
-                    callback.onError("Ultra preview session configure failed (Moto dual-device).")
+                    if (ultraPreview != null && !ultraPreviewFallbackTried) {
+                        fallbackUltraPreview()
+                    } else {
+                        callback.onError("Ultra preview session configure failed (Moto dual-device).")
+                    }
                 }
             },
-            handler
+            handler, { e -> onPreviewSessionFailed("Ultra preview", e) }
         )
+    }
+
+    /** The phone refused the ultra preview stream: retry reader-only so
+     *  photos/video still work, and tell the activity to go wide-only. */
+    private fun fallbackUltraPreview() {
+        if (ultraPreviewFallbackTried) return
+        ultraPreviewFallbackTried = true
+        sbsPreviewActive = false
+        Log.w(TAG, "Ultra preview stream refused; falling back to reader-only ultra session")
+        callback.onSbsPreviewFallback()
+        cameraHandler?.post { createDualUltraPreviewSession(includePreview = false) }
     }
 
 
@@ -2169,13 +2749,16 @@ class StereoCameraController(
         session = null
         repeatingBuilder = null
 
-        val outputs = ArrayList<OutputConfiguration>(3).apply {
+        val outputs = safeOutputConfigs {
             add(OutputConfiguration(preview).apply { setPhysicalCameraId(widePhysicalId) })
             add(OutputConfiguration(wideEnc.inputSurface).apply { setPhysicalCameraId(widePhysicalId) })
             add(OutputConfiguration(ultraEnc.inputSurface).apply { setPhysicalCameraId(ultraPhysicalId) })
+        } ?: run {
+            callback.onError("Recording session failed: preview surface abandoned")
+            return
         }
 
-        camera.createCaptureSessionByOutputConfigurations(
+        createSessionSafe(camera, 
             outputs,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(sess: CameraCaptureSession) {
@@ -2294,7 +2877,7 @@ class StereoCameraController(
                     isRecording = false
                 }
             },
-            handler
+            handler, { e -> callback.onError("Recording session failed: ${e.message}") }
         )
     }
 
@@ -2384,11 +2967,14 @@ class StereoCameraController(
         }
 
         // --- Wide recording session ---
-        val wideOutputs = ArrayList<OutputConfiguration>(2).apply {
+        val wideOutputs = safeOutputConfigs {
             add(OutputConfiguration(preview))
             add(OutputConfiguration(wideEnc.inputSurface))
+        } ?: run {
+            callback.onError("Recording session failed: preview surface abandoned")
+            return
         }
-        wideCamera.createCaptureSessionByOutputConfigurations(
+        createSessionSafe(wideCamera, 
             wideOutputs,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(sess: CameraCaptureSession) {
@@ -2422,14 +3008,20 @@ class StereoCameraController(
                     isRecording = false
                 }
             },
-            handler
+            handler, { e -> callback.onError("Recording session failed: ${e.message}") }
         )
 
-        // --- Ultra recording session ---
-        val ultraOutputs = ArrayList<OutputConfiguration>(1).apply {
+        // --- Ultra recording session: encoder (+ ultra preview, so the GPU
+        //  SBS preview stays live while recording) ---
+        val ultraPreviewRec = if (sbsPreviewActive) ultraPreviewSurface else null
+        val ultraOutputs = safeOutputConfigs {
             add(OutputConfiguration(ultraEnc.inputSurface))
+            if (ultraPreviewRec != null) add(OutputConfiguration(ultraPreviewRec))
+        } ?: run {
+            callback.onError("Recording session failed: ultra preview surface abandoned")
+            return
         }
-        ultraCamera.createCaptureSessionByOutputConfigurations(
+        createSessionSafe(ultraCamera, 
             ultraOutputs,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(sess: CameraCaptureSession) {
@@ -2437,6 +3029,7 @@ class StereoCameraController(
                     try {
                         val builder = ultraCamera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                             addTarget(ultraEnc.inputSurface)
+                            if (ultraPreviewRec != null) addTarget(ultraPreviewRec)
                             applyCommonNoCropNoStab(this, isVideo = true, targetFps = requestedRecordFps, forUltraDevice = true)
                             applyZoomCrop(this, ultraChars)
                             set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
@@ -2462,7 +3055,7 @@ class StereoCameraController(
                     isRecording = false
                 }
             },
-            handler
+            handler, { e -> callback.onError("Recording session failed: ${e.message}") }
         )
     }
 
@@ -2502,11 +3095,11 @@ class StereoCameraController(
         fun buildStillBuilder(
             camera: CameraDevice,
             targetReader: ImageReader,
-            includePreview: Boolean,
+            previewTarget: Surface?,
             forUltra: Boolean
         ): CaptureRequest.Builder {
             return camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                if (includePreview && preview != null) addTarget(preview)
+                if (previewTarget != null) addTarget(previewTarget)
                 addTarget(targetReader.surface)
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
@@ -2542,8 +3135,14 @@ class StereoCameraController(
             try { wideSess.stopRepeating() } catch (_: Exception) {}
             try { ultraSess.stopRepeating() } catch (_: Exception) {}
 
-            val wideBuilder = buildStillBuilder(wideCamera, wideR, includePreview = true, forUltra = false)
-            val ultraBuilder = buildStillBuilder(ultraCamera, ultraR, includePreview = false, forUltra = true)
+            val wideBuilder = buildStillBuilder(wideCamera, wideR, previewTarget = preview, forUltra = false)
+            // Ultra still keeps its own preview target too, so the GPU SBS
+            // preview does not go black on the ultra side during a shot.
+            val ultraBuilder = buildStillBuilder(
+                ultraCamera, ultraR,
+                previewTarget = if (sbsPreviewActive) ultraPreviewSurface else null,
+                forUltra = true
+            )
 
             wideSess.capture(
                 wideBuilder.build(),
@@ -3539,6 +4138,23 @@ class StereoCameraController(
         // harmless repeats for the two-stream path.
         if (isDirectRecording) {
             releaseDirectState()
+        }
+
+        // GPU mode (0.79.0): drop (or finalize, when this is a plain
+        // stop) the partial file. The recorder's render thread stops
+        // with the recorder.
+        if (isGpuRecording) {
+            val rec = gpuRecorder
+            gpuRecorder = null
+            gpuVideoUri = null
+            isGpuRecording = false
+            if (deleteOnFailure) {
+                try { rec?.releaseOnFailure() } catch (_: Exception) {}
+            } else {
+                encodingExecutor.execute {
+                    try { rec?.stopAndFinalize() } catch (_: Exception) {}
+                }
+            }
         }
 
         // Stop session output
